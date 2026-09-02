@@ -1,0 +1,89 @@
+/* Kinetic Typography Composer — chrome that Tailwind does not cover */
+
+:root { color-scheme: dark; }
+
+html, body { height: 100%; }
+body { -webkit-font-smoothing: antialiased; }
+
+/* ── scrollbars ───────────────────────────────────────────── */
+.scroll-thin { scrollbar-width: thin; scrollbar-color: #2c333f transparent; }
+.scroll-thin::-webkit-scrollbar { width: 9px; height: 9px; }
+.scroll-thin::-webkit-scrollbar-track { background: transparent; }
+.scroll-thin::-webkit-scrollbar-thumb { background: #2c333f; border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
+.scroll-thin::-webkit-scrollbar-thumb:hover { background: #3a4353; background-clip: content-box; }
+
+/* ── range inputs ─────────────────────────────────────────── */
+input[type="range"] {
+  -webkit-appearance: none; appearance: none;
+  height: 4px; border-radius: 99px; background: #222833; outline: none; cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: #e4e8ef; border: 2px solid #0d0f14;
+  box-shadow: 0 0 0 1px #38455c; cursor: grab; transition: transform .12s ease, background .12s ease;
+}
+input[type="range"]::-webkit-slider-thumb:hover { background: #fff; transform: scale(1.12); }
+input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; transform: scale(0.96); }
+input[type="range"]::-moz-range-thumb {
+  width: 13px; height: 13px; border-radius: 50%; background: #e4e8ef;
+  border: 2px solid #0d0f14; box-shadow: 0 0 0 1px #38455c; cursor: grab;
+}
+
+/* ── colour swatch ────────────────────────────────────────── */
+input[type="color"] { -webkit-appearance: none; appearance: none; padding: 0; }
+input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+input[type="color"]::-webkit-color-swatch { border: none; border-radius: 3px; }
+
+/* ── number spinners off ──────────────────────────────────── */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+
+/* ── viewport checkerboard behind the canvas ──────────────── */
+#stageFrame {
+  background-image:
+    linear-gradient(45deg, #101319 25%, transparent 25%),
+    linear-gradient(-45deg, #101319 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #101319 75%),
+    linear-gradient(-45deg, transparent 75%, #101319 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+/* ── stage rows ───────────────────────────────────────────── */
+.stage-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 7px; border-radius: 6px; cursor: pointer;
+  border: 1px solid transparent; background: #0d0f14;
+  transition: background .12s ease, border-color .12s ease;
+}
+.stage-row:hover { background: #161b24; }
+.stage-row.is-active { background: #161b24; border-color: var(--role, #38bdf8); }
+.stage-row .dot {
+  width: 18px; height: 18px; border-radius: 50%; flex: none;
+  display: grid; place-items: center; font-size: 10px; font-weight: 700;
+  color: #08090c; background: var(--role, #38bdf8);
+}
+
+/* ── pattern preview points ───────────────────────────────── */
+.pp { display: flex; align-items: center; gap: 0; min-width: max-content; padding: 2px 4px; }
+.pp-node {
+  width: 22px; height: 22px; border-radius: 50%; flex: none; cursor: pointer;
+  display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #08090c;
+  background: var(--role); transition: transform .12s ease, box-shadow .12s ease;
+}
+.pp-node:hover { transform: scale(1.12); }
+.pp-node.is-active { box-shadow: 0 0 0 2px #0d0f14, 0 0 0 3.5px var(--role); }
+.pp-node.pp-wide { width: 40px; border-radius: 11px; letter-spacing: -0.02em; }
+.pp-node.pp-small { width: 18px; height: 18px; font-size: 9px; }
+.pp-node.pp-small.pp-wide { width: 32px; border-radius: 9px; }
+.pp-link { min-width: 8px; }
+.stage-row .dot.dot-wide { width: 30px; border-radius: 9px; font-size: 9px; }
+.pp-link { height: 2px; width: 14px; flex: none; background: linear-gradient(90deg, var(--a), var(--b)); opacity: .5; }
+
+/* ── recording pulse ──────────────────────────────────────── */
+@keyframes recpulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+.is-recording { animation: recpulse 1s ease-in-out infinite; }
+
+#timelineCanvas { touch-action: none; }

@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "kinetic", "runtimeExecutable": "python3", "runtimeArgs": ["serve.py", "5178"], "port": 5178 }
+  ]
+}

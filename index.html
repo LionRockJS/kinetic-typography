@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-Hant" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kinetic Typography Composer · 起承轉合</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        base:   { 900:'#08090c', 800:'#0d0f14', 700:'#12151c', 600:'#181c25', 500:'#222833' },
+        line:   '#242a36',
+        qi:     '#38bdf8',
+        cheng:  '#34d399',
+        zhuan:  '#f472b6',
+        he:     '#fbbf24'
+      },
+      fontFamily: {
+        ui: ['Inter','-apple-system','BlinkMacSystemFont','Segoe UI','PingFang TC','Noto Sans TC','Helvetica Neue','sans-serif'],
+        mono: ['ui-monospace','SFMono-Regular','Menlo','monospace']
+      }
+    }
+  }
+}
+</script>
+<style type="text/tailwindcss">
+  @layer components {
+    .panel      { @apply border-b border-line/80; }
+    .panel-hd   { @apply flex items-center justify-between px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500 select-none; }
+    .panel-bd   { @apply px-3 pb-3 space-y-2.5; }
+    .lbl        { @apply block text-[10px] font-medium uppercase tracking-wider text-zinc-500 mb-1; }
+    .inp        { @apply w-full bg-base-900 border border-line rounded-md px-2 py-1.5 text-xs text-zinc-200 outline-none transition
+                        focus:border-sky-500/70 focus:ring-1 focus:ring-sky-500/30 placeholder:text-zinc-600; }
+    .sel        { @apply w-full bg-base-900 border border-line rounded-md px-2 py-1.5 text-xs text-zinc-200 outline-none cursor-pointer
+                        focus:border-sky-500/70; }
+    .btn        { @apply inline-flex items-center justify-center gap-1.5 rounded-md border border-line bg-base-600 px-2.5 py-1.5
+                        text-xs font-medium text-zinc-300 transition hover:bg-base-500 hover:text-white active:scale-[0.97]
+                        disabled:opacity-40 disabled:pointer-events-none select-none; }
+    .btn-pri    { @apply bg-sky-600 border-sky-500 text-white hover:bg-sky-500; }
+    .btn-sq     { @apply w-8 h-8 p-0; }
+    .btn-ghost  { @apply bg-transparent border-transparent hover:bg-base-600; }
+    .chip       { @apply px-1.5 py-0.5 rounded text-[10px] font-mono tabular-nums bg-base-600 text-zinc-400; }
+    .tog        { @apply flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none; }
+  }
+</style>
+<link rel="stylesheet" href="./css/app.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "opentype.js": "https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.module.js"
+  }
+}
+</script>
+</head>
+<body class="bg-base-900 text-zinc-300 font-ui text-sm antialiased overflow-hidden h-screen select-none">
+
+<div class="flex flex-col h-screen">
+
+  <!-- ══ TOP BAR ══════════════════════════════════════════════ -->
+  <header class="h-12 shrink-0 flex items-center gap-3 px-3 border-b border-line bg-base-800">
+    <div class="flex items-center gap-2 pr-3 mr-1 border-r border-line">
+      <div class="w-6 h-6 rounded bg-gradient-to-br from-sky-400 via-pink-400 to-amber-300 grid place-items-center text-[11px] font-bold text-base-900">起</div>
+      <span class="text-[13px] font-semibold text-zinc-200 tracking-tight whitespace-nowrap">Kinetic Typography</span>
+    </div>
+
+    <input id="projName" class="inp !w-44 !py-1" value="Untitled Composition" spellcheck="false">
+
+    <div class="flex items-center gap-1.5 pl-3 border-l border-line">
+      <span class="text-[10px] uppercase tracking-wider text-zinc-500">Size</span>
+      <select id="dimPreset" class="sel !w-32 !py-1"></select>
+      <input id="dimW" type="number" min="64" max="4096" step="1" class="inp !w-16 !py-1 text-center font-mono">
+      <span class="text-zinc-600 text-xs">×</span>
+      <input id="dimH" type="number" min="64" max="4096" step="1" class="inp !w-16 !py-1 text-center font-mono">
+    </div>
+
+    <div class="flex items-center gap-1.5 pl-3 border-l border-line">
+      <span class="text-[10px] uppercase tracking-wider text-zinc-500">Dur</span>
+      <input id="durInput" type="number" min="1" max="900" step="0.1" class="inp !w-20 !py-1 text-center font-mono">
+      <span class="text-[10px] text-zinc-600">s</span>
+      <span class="text-[10px] uppercase tracking-wider text-zinc-500 ml-2">FPS</span>
+      <input id="fpsInput" type="number" min="1" max="120" step="1" class="inp !w-14 !py-1 text-center font-mono">
+    </div>
+
+    <div class="flex-1"></div>
+
+    <div class="flex items-center gap-1.5">
+      <button id="btnSave" class="btn" title="Download project JSON">Save</button>
+      <button id="btnLoad" class="btn" title="Open project JSON">Open</button>
+      <button id="btnRecord" class="btn" title="Record a WebM video in real time">
+        <span class="w-2 h-2 rounded-full bg-red-500"></span> Record
+      </button>
+    </div>
+  </header>
+
+  <!-- ══ BODY ═════════════════════════════════════════════════ -->
+  <div class="flex-1 flex min-h-0">
+
+    <!-- ── LEFT: structure + audio ─────────────────────────── -->
+    <aside class="w-[300px] shrink-0 border-r border-line bg-base-800 overflow-y-auto scroll-thin">
+
+      <section class="panel">
+        <div class="panel-hd"><span>Structure · 起承轉合</span><span id="patternChip" class="chip"></span></div>
+        <div class="panel-bd">
+          <p class="text-[11px] leading-relaxed text-zinc-500">
+            <b class="text-sky-400">起</b> is a short strike — the start point.
+            <b class="text-emerald-400">承</b> is the long stretch that spreads out from it.
+            <b class="text-pink-400">轉</b> is the change point, a second or two.
+            <b class="text-amber-400">合</b> resolves. After a 轉 comes another 承.
+          </p>
+          <p class="text-[11px] leading-relaxed text-zinc-600">
+            Two levels: the <span class="text-zinc-400">overall</span> arc runs through the whole video and
+            stays simple; the <span class="text-zinc-400">animation</span> arc is the finer beat the layers
+            move to, with its own span. Both are reference lines only — like a grid on a canvas.
+          </p>
+
+          <div id="levelPanels" class="space-y-2"></div>
+
+          <div class="grid grid-cols-2 gap-1.5">
+            <button id="btnBalance" class="btn" title="Reset both levels to their default weighting">Rebalance</button>
+            <button id="btnFitBars" class="btn" title="Overall to bars, animation to beats">Fit to music</button>
+          </div>
+          <label class="tog"><input id="tSnapGuides" type="checkbox" class="accent-sky-500" checked> Snap layers to 起承轉合</label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Layers</span><span id="clipChip" class="chip">0</span></div>
+        <div class="panel-bd">
+          <div class="grid grid-cols-2 gap-1.5">
+            <button id="btnAddClip" class="btn">Add text</button>
+            <button id="btnDupClip" class="btn">Duplicate</button>
+          </div>
+          <div id="clipList" class="space-y-1"></div>
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            Double-click an empty spot on a track to drop a layer there; drag its edges to trim,
+            drag it up or down to change track.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Audio</span><span id="audioChip" class="chip">no audio</span></div>
+        <div class="panel-bd">
+          <div id="audioLanes" class="space-y-1.5"></div>
+          <input id="audioFile" type="file" accept="audio/*" class="hidden">
+
+          <div id="audioProgress" class="hidden">
+            <div class="h-1 rounded-full bg-base-600 overflow-hidden">
+              <div id="audioBar" class="h-full w-0 bg-sky-500 transition-[width] duration-150"></div>
+            </div>
+            <div id="audioStatus" class="text-[10px] text-zinc-500 mt-1">Analysing…</div>
+          </div>
+
+          <div id="audioInfo" class="hidden space-y-2.5 pt-1 border-t border-line/70">
+            <div class="grid grid-cols-4 gap-1">
+              <div class="rounded-md bg-base-900 border border-line py-1.5 text-center">
+                <div id="statBpm" class="text-[11px] font-semibold text-zinc-200 font-mono">–</div>
+                <div class="text-[9px] uppercase tracking-wider text-zinc-600">BPM</div>
+              </div>
+              <div class="rounded-md bg-base-900 border border-line py-1.5 text-center">
+                <div id="statBeats" class="text-[11px] font-semibold text-zinc-200 font-mono">–</div>
+                <div class="text-[9px] uppercase tracking-wider text-zinc-600">Beats</div>
+              </div>
+              <div class="rounded-md bg-base-900 border border-line py-1.5 text-center">
+                <div id="statHits" class="text-[11px] font-semibold text-amber-300 font-mono">–</div>
+                <div class="text-[9px] uppercase tracking-wider text-zinc-600">Peaks</div>
+              </div>
+              <div class="rounded-md bg-base-900 border border-line py-1.5 text-center">
+                <div id="statLen" class="text-[11px] font-semibold text-zinc-200 font-mono">–</div>
+                <div class="text-[9px] uppercase tracking-wider text-zinc-600">Length</div>
+              </div>
+            </div>
+
+            <div>
+              <span class="lbl">Beat offset <span id="offsetVal" class="text-zinc-400 font-mono normal-case"></span></span>
+              <input id="offsetSlider" type="range" min="-1" max="1" step="0.001" value="0" class="w-full">
+            </div>
+
+            <div class="rounded-md border border-line bg-base-900 p-2 space-y-2">
+              <label class="tog"><input id="tSnapPeaks" type="checkbox" class="accent-amber-500" checked>
+                <span class="text-amber-300">Snap to peaks</span></label>
+              <div>
+                <span class="lbl">Minimum spacing <span id="hitGapVal" class="text-zinc-400 font-mono normal-case"></span></span>
+                <input id="hitGap" type="range" min="0.05" max="2" step="0.01" class="w-full">
+              </div>
+              <div>
+                <span class="lbl">Sensitivity <span id="hitSenseVal" class="text-zinc-400 font-mono normal-case"></span></span>
+                <input id="hitSense" type="range" min="0" max="0.9" step="0.01" class="w-full">
+              </div>
+              <p class="text-[10px] leading-snug text-zinc-600">
+                Transients detected in the music. Raising the spacing keeps only the strongest hit in
+                each window, so points never land on top of each other.
+              </p>
+            </div>
+
+            <label class="tog"><input id="tSnap" type="checkbox" class="accent-sky-500" checked> Snap to beats and bars</label>
+            <button id="btnUseAudioLen" class="btn w-full">Match composition to music</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd">
+          <span>Metronome</span>
+          <span id="metroChip" class="chip">off</span>
+        </div>
+        <div class="panel-bd">
+          <div class="flex items-center gap-1.5">
+            <button id="btnMetro" class="btn flex-1">Click off</button>
+            <select id="metroVoice" class="sel !w-24"></select>
+          </div>
+
+          <div>
+            <span class="lbl">Level <span id="metroVolVal" class="text-zinc-400 font-mono normal-case"></span></span>
+            <input id="metroVol" type="range" min="0" max="1" step="0.01" class="w-full">
+          </div>
+
+          <div>
+            <span class="lbl">Tempo source</span>
+            <div class="grid grid-cols-2 gap-1.5">
+              <button id="metroSrcTrack" class="btn">Follow track</button>
+              <button id="metroSrcManual" class="btn">Manual BPM</button>
+            </div>
+          </div>
+
+          <div id="metroManual" class="space-y-2.5">
+            <div>
+              <span class="lbl">BPM</span>
+              <div class="flex items-center gap-1.5">
+                <input id="metroBpm" type="number" min="20" max="300" step="0.1" class="inp !py-1 font-mono text-center">
+                <button id="metroTap" class="btn !px-2.5" title="Tap four times in tempo">Tap</button>
+              </div>
+            </div>
+            <div>
+              <span class="lbl">Grid offset <span id="metroOffVal" class="text-zinc-400 font-mono normal-case"></span></span>
+              <input id="metroOff" type="range" min="-1" max="1" step="0.001" class="w-full">
+            </div>
+          </div>
+
+          <div>
+            <span class="lbl">Beats per bar</span>
+            <select id="beatsPerBar" class="sel">
+              <option value="2">2</option><option value="3">3</option>
+              <option value="4" selected>4</option><option value="6">6</option><option value="8">8</option>
+            </select>
+          </div>
+
+          <label class="tog"><input id="metroAccent" type="checkbox" class="accent-sky-500" checked> Accent the downbeat</label>
+          <label class="tog"><input id="metroRec" type="checkbox" class="accent-sky-500"> Include the click in recordings</label>
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            The click is its own bus — it plays over the imported track, and with no music loaded the
+            manual tempo still gives you a grid to snap to.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Typefaces</span><span id="fontChip" class="chip">loading…</span></div>
+        <div class="panel-bd">
+          <p class="text-[11px] leading-relaxed text-zinc-500">
+            A fallback stack. Each character is drawn with the first font that actually has a glyph
+            for it — so a Latin display face can carry the headline while a CJK face picks up 起承轉合.
+          </p>
+          <div id="fontSlots" class="space-y-1.5"></div>
+          <input id="fontFile" type="file" accept=".ttf,.otf,.woff,font/*" class="hidden">
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            Outlines are extracted with opentype.js and triangulated into three.js meshes — every glyph is an
+            independent object, so effects can move them one by one.
+          </p>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ── CENTER: viewport ────────────────────────────────── -->
+    <main class="flex-1 min-w-0 flex flex-col bg-base-900">
+      <div id="viewport" class="flex-1 min-h-0 relative grid place-items-center p-6 overflow-hidden">
+        <div id="stageFrame" class="relative shadow-[0_0_0_1px_rgba(255,255,255,0.07),0_24px_60px_-12px_rgba(0,0,0,0.9)] rounded-sm overflow-hidden">
+          <canvas id="stageCanvas" class="block"></canvas>
+          <div id="safeArea" class="hidden absolute inset-[5%] border border-dashed border-white/15 pointer-events-none"></div>
+        </div>
+        <div class="absolute top-3 left-3 flex items-center gap-2 pointer-events-none">
+          <span id="vpDim" class="chip !bg-black/50 backdrop-blur"></span>
+          <span id="vpStage" class="chip !bg-black/50 backdrop-blur"></span>
+        </div>
+        <div class="absolute top-3 right-3 flex items-center gap-1.5">
+          <label class="tog !text-[10px] px-2 py-1 rounded bg-black/50 backdrop-blur">
+            <input id="tSafe" type="checkbox" class="accent-sky-500"> Safe area
+          </label>
+        </div>
+      </div>
+    </main>
+
+    <!-- ── RIGHT: inspector ────────────────────────────────── -->
+    <aside class="w-[320px] shrink-0 border-l border-line bg-base-800 overflow-y-auto scroll-thin">
+      <section class="panel">
+        <div class="panel-hd"><span id="inspTitle">Layer</span><span id="inspChip" class="chip">–</span></div>
+        <div id="inspector" class="panel-bd"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd">
+          <span>Camera</span>
+          <span id="camChip" class="chip">no keys</span>
+        </div>
+        <div class="panel-bd">
+          <label class="tog"><input id="camEnabled" type="checkbox" class="accent-violet-500" checked> Camera track active</label>
+          <div class="grid grid-cols-2 gap-1.5">
+            <button id="btnCamKey" class="btn">Key at playhead</button>
+            <button id="btnCamClear" class="btn">Clear track</button>
+          </div>
+          <div id="camKeyPanel" class="space-y-2.5"></div>
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            The camera moves the view, so every live layer is affected at once — and since the stage is
+            rendered in perspective, panning gives real parallax against glyphs pushed into depth.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Look</span></div>
+        <div class="panel-bd">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <span class="lbl">Background</span>
+              <input id="bgColor" type="color" class="w-full h-8 bg-base-900 border border-line rounded cursor-pointer">
+            </div>
+            <div>
+              <span class="lbl">Vignette <span id="vigVal" class="text-zinc-400 font-mono normal-case"></span></span>
+              <input id="vignette" type="range" min="0" max="1" step="0.01" class="w-full mt-2">
+            </div>
+          </div>
+          <div>
+            <span class="lbl">Grain <span id="grainVal" class="text-zinc-400 font-mono normal-case"></span></span>
+            <input id="grain" type="range" min="0" max="0.5" step="0.005" class="w-full">
+          </div>
+          <div>
+            <span class="lbl">Depth of glyphs <span id="depthVal" class="text-zinc-400 font-mono normal-case"></span></span>
+            <input id="depth" type="range" min="0" max="60" step="1" class="w-full">
+          </div>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- ══ TIMELINE ═════════════════════════════════════════════ -->
+  <footer class="shrink-0 border-t border-line bg-base-800">
+    <div class="h-10 flex items-center gap-2 px-3 border-b border-line/70">
+      <button id="btnPlay" class="btn btn-pri btn-sq" title="Play / Pause (Space)">
+        <svg id="icPlay" width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><path d="M2.5 1.5l7.5 4.5-7.5 4.5z"/></svg>
+        <svg id="icPause" width="12" height="12" viewBox="0 0 12 12" fill="currentColor" class="hidden"><path d="M2.5 1.5h2.5v9h-2.5zM7 1.5h2.5v9h-2.5z"/></svg>
+      </button>
+      <button id="btnStop" class="btn btn-sq" title="Return to start (Home)">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><rect width="10" height="10" rx="1"/></svg>
+      </button>
+      <label class="tog ml-1"><input id="tLoop" type="checkbox" class="accent-sky-500"> Loop</label>
+
+      <div class="ml-3 font-mono text-xs tabular-nums">
+        <span id="timeNow" class="text-zinc-100">00:00.00</span>
+        <span class="text-zinc-600"> / </span>
+        <span id="timeTotal" class="text-zinc-500">00:00.00</span>
+      </div>
+      <span id="frameNow" class="chip ml-1">f 0</span>
+
+      <div class="flex-1"></div>
+
+      <div class="flex items-center gap-1.5 text-[10px] text-zinc-500">
+        <span class="hidden xl:inline text-zinc-600">drag point = move · drag end cap = stretch · ⌥ keeps positions · ⇧ ignores snap</span>
+        <button id="btnZoomOut" class="btn btn-sq">−</button>
+        <button id="btnZoomFit" class="btn !px-2">Fit</button>
+        <button id="btnZoomIn" class="btn btn-sq">+</button>
+      </div>
+    </div>
+    <div class="relative">
+      <canvas id="timelineCanvas" class="block w-full cursor-default" style="height:220px"></canvas>
+      <div id="tlTip" class="hidden absolute z-10 px-1.5 py-0.5 rounded bg-black/85 border border-line text-[10px] font-mono text-zinc-200 pointer-events-none whitespace-nowrap"></div>
+    </div>
+  </footer>
+</div>
+
+<input id="projFile" type="file" accept="application/json,.json" class="hidden">
+
+<div id="toast" class="fixed bottom-[210px] left-1/2 -translate-x-1/2 z-50 hidden px-3 py-2 rounded-md bg-base-600 border border-line text-xs text-zinc-200 shadow-xl"></div>
+
+<div id="boot" class="fixed inset-0 z-[60] bg-base-900 grid place-items-center transition-opacity duration-500">
+  <div class="text-center">
+    <div class="text-3xl font-semibold tracking-[0.35em] text-zinc-200 mb-3">起承轉合</div>
+    <div id="bootMsg" class="text-xs text-zinc-500 font-mono">loading typeface…</div>
+  </div>
+</div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
