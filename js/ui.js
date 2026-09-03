@@ -3,33 +3,69 @@
 import { state, level, guides, clips, selectedClip, selectedGuide, selectedGuideIds,
          selectedGuideIndices, select, selectGuide, on, emit, patch,
          setRepeats, setDuration, updateClip, commitGuides, addClip, reframe,
-         duplicateClip, removeClip, serialize, deserialize, track, anyAudio,
-         setTrackStart, setTrackLevel, setHitParams, syncBeatTimes,
-         beatTimes, barTimes, setMetro, hasGrid, camera, cameraKeys, selectedCamKey,
-         addCameraKey, updateCameraKey, removeCameraKey, setCameraEnabled, commitCameraKeys,
+         duplicateClip, removeClip, serialize, deserialize, track, audioClips, anyAudio,
+         setTrackStart, setTrackLevel, setAudioClipStart, setAudioClipLevel,
+         setHitParams, syncBeatTimes,
+         beatTimes, barTimes, setMetro, hasGrid, setRunPivot, runPivotIndex,
+         videoClips, videoClip,
+         setVideoClipStart, setVideoClipSettings,
+         particleEmitters, selectedEmitter, selectEmitter, updateEmitter,
+         addParticleEmitter, duplicateParticleEmitter, removeParticleEmitter,
+         camera, cameraKeys, cameraMode, cameraChannelKeys, cameraKeyCount,
+         selectedCamKey, selectedCamAxis,
+         addCameraKey, addCameraChannelKey, setCameraChannelSpan,
+         updateCameraKey, updateCameraChannelKey, removeCameraKey, removeCameraChannelKey,
+         setCameraMode, setCameraEnabled, clearCameraTrack,
+         selectCameraKey,
+         alignClipWithCamera,
+         copyClipData, pasteClip, CLIPBOARD_FORMAT,
          FONT_SLOTS, DIM_PRESETS,
          TRACKS, MIN_CLIP } from './state.js';
 import { VOICES } from './audio/metronome.js';
-import { EASES, cameraAt, CAMERA_REST } from './camera.js';
+import { EASES, cameraAt, defaultCameraPosition } from './camera.js';
 import { TRACK_KINDS } from './audio/engine.js';
+import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
+import { PARTICLE_SHAPES, PARTICLE_ORIGINS, TEXT_MODES, MAX_EMITTERS } from './particles.js';
 import { ROLES, LEVELS, LEVEL_KEYS, patternLabel, rebalanceGuides, guideDisplay, guideHandles,
-         regionAt, drivingRegion, normalizeGuides, scaleRange, distributeRange } from './structure.js';
+         regionAt, drivingRegion, normalizeGuides, scaleRange, distributeRange, DISTRIBUTIONS } from './structure.js';
 import { EFFECTS, effectsForRole, effectIds, resolveParams } from './effects.js';
 import { FONT_PRESETS } from './typography.js';
 import { $, el, fmtTime, fmtDur, clamp, download, toast, nearest, round } from './util.js';
 
 let app;
+let clipClipboard = null;
+
+const PROJECT_FORMAT = 'kinetic-typography-composer';
+const PROJECT_VERSION = 8;
+
+function parseProjectFile(text) {
+  // JSON exported by some desktop/browser combinations can start with a UTF-8
+  // BOM. JSON.parse rejects that character even though the rest is valid JSON.
+  const value = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Project file must contain a JSON object');
+  }
+  if (value.format !== PROJECT_FORMAT) throw new Error('Not a composer file');
+  const version = Number(value.version);
+  if (Number.isFinite(version) && version > PROJECT_VERSION) {
+    throw new Error(`Project format v${version} is newer than this composer`);
+  }
+  return value;
+}
 
 export function initUI(ctx) {
   app = ctx;
   buildTopBar();
   buildStructure();
   buildLayers();
+  buildVideoPanel();
   buildAudioPanel();
   buildMetroPanel();
   buildFontPanel();
   buildCameraPanel();
+  buildParticlePanel();
   buildLookPanel();
+  buildViewport();
   buildTransport();
   buildShortcuts();
 
@@ -40,18 +76,23 @@ export function initUI(ctx) {
   on('camera', renderCameraPanel);
   on('clip', () => { renderClipList(); });
   on('audio audioMove audioLevel hits', syncAudioPanel);
+  on('video videoMove videoLevel', syncVideoPanel);
+  on('particles project duration', renderParticlePanel);
   on('metro grid audio', syncMetroPanel);
   on('fonts', syncFontPanel);
+  on('view', syncViewMode);
   on('time clips clip guides audioMove', syncTime);
 
   syncTopBar();
   renderPattern();
   renderClipList();
+  renderVideoChannels();
   buildInspector();
   renderCameraPanel();
   syncAudioPanel();
   syncMetroPanel();
   syncFontPanel();
+  syncViewMode();
   syncTime();
 }
 
@@ -90,11 +131,27 @@ function buildTopBar() {
     toast('Project saved');
   });
   $('#btnLoad').addEventListener('click', () => $('#projFile').click());
+  const openProject = projectFile => {
+    if (!projectFile || projectFile.format !== PROJECT_FORMAT) throw new Error('Not a composer file');
+    // The project file stores media references, not browser-owned buffers.
+    // Drop the current runtime sources before replacing their metadata so
+    // audio from the previous project cannot keep playing after Open.
+    for (const { kind } of TRACK_KINDS) app.clearAudio?.(kind);
+    app.clearVideos?.();
+    deserialize(projectFile);
+    app.timeline.fit();
+    toast('Project loaded — re-import saved audio and backdrop media to attach them');
+  };
+
   $('#projFile').addEventListener('change', async e => {
     const f = e.target.files?.[0];
     if (!f) return;
-    try { deserialize(JSON.parse(await f.text())); app.timeline.fit(); toast('Project loaded'); }
-    catch { toast('Could not read that file'); }
+    try {
+      openProject(parseProjectFile(await f.text()));
+    } catch (err) {
+      console.error('Could not open project file', err);
+      toast('Could not read that file');
+    }
     e.target.value = '';
   });
   $('#btnRecord').addEventListener('click', () => app.toggleRecord());
@@ -268,6 +325,100 @@ function buildLayers() {
     if (!c) { toast('Select a layer first'); return; }
     duplicateClip(c.id);
   });
+  $('#btnCopyClip').addEventListener('click', copySelectedClipToClipboard);
+  $('#btnPasteClip').addEventListener('click', pasteClipFromClipboard);
+}
+
+function clipboardText(data) {
+  return JSON.stringify(data);
+}
+
+function isEditableTarget(target) {
+  const tag = target?.tagName;
+  return tag === 'TEXTAREA' || tag === 'SELECT' ||
+    (tag === 'INPUT' && target.type !== 'range') || target?.isContentEditable;
+}
+
+function canHandleClipboardEvent(event) {
+  if (isEditableTarget(event.target)) return false;
+  const selection = window.getSelection?.();
+  return !selection || selection.isCollapsed;
+}
+
+function rememberSelectedClip() {
+  const c = selectedClip();
+  if (!c) {
+    toast('Select a layer first');
+    return null;
+  }
+  clipClipboard = copyClipData(c.id, state.ui.time);
+  return clipClipboard;
+}
+
+async function copySelectedClipToClipboard() {
+  const data = rememberSelectedClip();
+  if (!data) return false;
+  const text = clipboardText(data);
+  try {
+    await navigator.clipboard?.writeText(text);
+  } catch {
+    // The in-memory payload still makes copy/paste work when clipboard access
+    // is unavailable (for example, when the app is opened without HTTPS).
+  }
+  toast('Layer copied');
+  return true;
+}
+
+function parseClipClipboard(text) {
+  if (!text) return null;
+  try {
+    const data = JSON.parse(text);
+    return data?.format === CLIPBOARD_FORMAT && data.clip ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function pasteClipData(data) {
+  const clip = pasteClip(data, state.ui.time);
+  if (!clip) return false;
+  app.timeline.draw();
+  toast('Layer pasted at playhead');
+  return true;
+}
+
+async function pasteClipFromClipboard() {
+  let data = null;
+  try {
+    const text = await navigator.clipboard?.readText();
+    data = parseClipClipboard(text);
+  } catch {
+    // Fall back to the last in-app copy below.
+  }
+  if (!data) data = clipClipboard;
+  if (!data) {
+    toast('Copy a layer first');
+    return false;
+  }
+  return pasteClipData(data);
+}
+
+function handleClipCopyEvent(event) {
+  if (!canHandleClipboardEvent(event)) return;
+  const data = rememberSelectedClip();
+  if (!data) return;
+  event.clipboardData?.setData('text/plain', clipboardText(data));
+  event.preventDefault();
+  toast('Layer copied');
+}
+
+function handleClipPasteEvent(event) {
+  if (!canHandleClipboardEvent(event)) return;
+  const text = event.clipboardData?.getData('text/plain');
+  const data = parseClipClipboard(text) ?? (!text ? clipClipboard : null);
+  if (!data) return;
+  event.preventDefault();
+  pasteClipData(data);
 }
 
 function firstFreeTrack(start, end) {
@@ -395,9 +546,17 @@ function buildInspector() {
     slider('Line height', clip.lineHeight, 0.6, 2.4, 0.01, v => updateClip(clip.id, { lineHeight: v })),
     slider('Letter spacing', clip.tracking, -0.3, 1, 0.005, v => updateClip(clip.id, { tracking: v })),
 
-    el('div', { class: 'grid grid-cols-2 gap-2' },
-      slider('Offset X', clip.offsetX, -0.5, 0.5, 0.005, v => updateClip(clip.id, { offsetX: v })),
-      slider('Offset Y', clip.offsetY, -0.5, 0.5, 0.005, v => updateClip(clip.id, { offsetY: v }))),
+    field('Position · scene units', el('div', { class: 'space-y-1.5' },
+      positionFields(clip.position,
+        pos => updateClip(clip.id, { position: { ...(clip.position ?? {}), ...pos } })),
+      el('button', {
+        class: 'btn w-full',
+        title: 'Place this text on the current camera frame',
+        onClick: () => {
+          alignClipWithCamera(clip.id);
+          buildInspector();
+        }
+      }, 'Align with camera'))),
 
     field('Track', el('select', {
       class: 'sel', onChange: e => { updateClip(clip.id, { track: +e.target.value }); app.timeline.draw(); renderClipList(); }
@@ -471,22 +630,28 @@ function buildRunInspector(host, lv, picked) {
   const meta = LEVELS[lv.key];
   const i0 = picked[0], i1 = picked.at(-1);
   const from = lv.guides[i0].t, to = lv.guides[i1].t;
-  builtFor = 'run:' + lv.key + ':' + picked.join(',');
+  builtFor = 'run:' + lv.key + ':' + picked.join(',') + ':' + runPivotIndex(lv.key);
   $('#inspTitle').textContent = 'Reference lines';
   $('#inspChip').textContent = `${meta.cn} · ${picked.length} points`;
 
   const labels = picked.map(i => guideDisplay(lv.guides, i));
+  const pivotIdx = runPivotIndex(lv.key);
 
-  host.append(
+  const parts = [
     el('div', { class: 'rounded-md border border-line bg-base-900 p-2 space-y-1.5' },
       el('div', { class: 'flex flex-wrap gap-1' },
         ...labels.map((d, k) => el('span', {
-          class: 'px-1.5 py-0.5 rounded text-[10px] font-semibold',
-          style: { background: d.colors.at(-1) + '22', color: d.colors.at(-1) }
-        }, d.label + (k < labels.length - 1 ? '' : '')))),
+          class: 'px-1.5 py-0.5 rounded text-[10px] font-semibold cursor-pointer transition' +
+                 (picked[k] === pivotIdx ? ' ring-1 ring-zinc-200' : ''),
+          style: { background: d.colors.at(-1) + '22', color: d.colors.at(-1) },
+          title: picked[k] === pivotIdx ? 'The centre — click to release' : 'Make this the centre',
+          onClick: () => { setRunPivot(lv.guides[picked[k]].id); app.timeline.draw(); buildInspector(); }
+        }, d.label))),
       el('p', { class: 'text-[10px] leading-snug text-zinc-500' },
-        'Drag either end point to rescale the run by ratio; drag one in the middle to slide it. ',
-        'Points outside the run stay put.')),
+        pivotIdx >= 0
+          ? 'Dragging either end now resizes the run around the centre — both sides move. Click the centre again to release it.'
+          : 'Drag either end to rescale from the far end; drag one in the middle to slide the run. Click a point to make it the centre.',
+        ' Points outside the run stay put.')),
 
     el('div', { class: 'grid grid-cols-3 gap-1.5 text-center' },
       box('runFrom', 'From'), box('runLen', 'Span'), box('runTo', 'To')),
@@ -503,20 +668,53 @@ function buildRunInspector(host, lv, picked) {
       }
     })),
 
+    pivotIdx >= 0
+      ? el('div', { class: 'flex items-center gap-1.5 rounded-md border border-line bg-base-900 px-2 py-1.5' },
+          el('span', { class: 'text-[10px] text-zinc-500 flex-1' },
+            'Centre: ', el('b', { class: 'text-zinc-200' }, guideDisplay(lv.guides, pivotIdx).label),
+            ` at ${lv.guides[pivotIdx].t.toFixed(2)}s`),
+          el('button', {
+            class: 'btn !px-2 !py-0.5 !text-[10px]',
+            onClick: () => { setRunPivot(lv.guides[pivotIdx].id); app.timeline.draw(); buildInspector(); }
+          }, 'Release'))
+      : null,
+
+    field('Distribution', el('div', { class: 'space-y-1.5' },
+      (() => {
+        const mode = el('select', {
+          class: 'sel', title: 'Choose how the selected points are spaced',
+          'aria-label': 'Distribution shape'
+        }, ...Object.entries(DISTRIBUTIONS).map(([id, d]) =>
+          el('option', { value: id }, d.label)));
+        const hint = el('p', { class: 'text-[10px] leading-snug text-zinc-600' },
+          DISTRIBUTIONS[mode.value].description);
+        mode.addEventListener('change', () => {
+          hint.textContent = DISTRIBUTIONS[mode.value].description;
+        });
+        return el('div', { class: 'space-y-1.5' },
+          el('div', { class: 'flex gap-1.5' },
+            mode,
+            el('button', {
+              class: 'btn shrink-0', title: 'Apply the selected distribution',
+              onClick: () => {
+                const d = DISTRIBUTIONS[mode.value] ?? DISTRIBUTIONS.even;
+                if (distributeRange(lv, i0, i1, mode.value)) {
+                  commitGuides(lv.key); app.timeline.draw(); buildInspector();
+                  toast(`${d.label} distribution applied`);
+                } else toast('Not enough span for that distribution');
+              }
+            }, 'Apply')),
+          hint);
+      })())),
+
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
-      el('button', {
-        class: 'btn', title: 'Space the points inside the run evenly',
-        onClick: () => {
-          if (distributeRange(lv, i0, i1)) { commitGuides(lv.key); app.timeline.draw(); buildInspector(); toast('Points distributed evenly'); }
-          else toast('Not enough points to distribute');
-        }
-      }, 'Distribute'),
       el('button', { class: 'btn', onClick: () => select(null, null) }, 'Clear selection')),
 
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
       el('button', { class: 'btn', onClick: () => app.seek(from) }, 'Go to start'),
       el('button', { class: 'btn', onClick: () => app.playRange(from, to) }, 'Preview run'))
-  );
+  ];
+  host.append(...parts.filter(Boolean));
   syncInspector();
 }
 
@@ -560,7 +758,31 @@ function slider(label, value, min, max, step, onChange, hint = null) {
     }));
 }
 
+/** Three editable world-space coordinates shared by text and camera objects. */
+function positionFields(position = {}, onChange) {
+  const p = { x: Number(position.x) || 0, y: Number(position.y) || 0, z: Number(position.z) || 0 };
+  return el('div', { class: 'grid grid-cols-3 gap-1.5' },
+    ...['x', 'y', 'z'].map(axis => el('label', { class: 'block' },
+      el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600' }, axis),
+      el('input', {
+        type: 'number', step: '0.1', value: round(p[axis], 1),
+        class: 'inp !py-1 font-mono text-[11px]',
+        onChange: e => onChange({ [axis]: Number.isFinite(Number(e.target.value)) ? Number(e.target.value) : 0 })
+      }))));
+}
+
 const fmtNum = v => Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+
+/**
+ * True while the keyboard is inside this panel. Panels that rebuild themselves
+ * from scratch must not do it under the user's fingers: replacing the node tree
+ * destroys the focused control, which drops keyboard focus back to the document
+ * and sends the next arrow key to the timeline instead of to the slider.
+ */
+const holdsFocus = host => {
+  const a = document.activeElement;
+  return !!host && !!a && host.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName);
+};
 
 function syncInspector() {
   const set = (id, v) => { const n = $(id); if (n) n.textContent = v; };
@@ -576,7 +798,7 @@ function syncInspector() {
     const g = guide.guide, lv = guide.level;
     const picked = selectedGuideIndices(lv.key);
     if (picked.length > 1) {
-      if (builtFor !== 'run:' + lv.key + ':' + picked.join(',')) { buildInspector(); return; }
+      if (builtFor !== 'run:' + lv.key + ':' + picked.join(',') + ':' + runPivotIndex(lv.key)) { buildInspector(); return; }
       const from = lv.guides[picked[0]].t, to = lv.guides[picked.at(-1)].t;
       set('#runFrom', `${from.toFixed(2)}s`);
       set('#runLen', `${(to - from).toFixed(2)}s`);
@@ -594,11 +816,270 @@ function syncInspector() {
   }
 }
 
+// ══ backdrop video ═══════════════════════════════════════════
+function buildVideoPanel() {
+  $('#videoFile').addEventListener('change', e => {
+    const kind = e.target.dataset.kind || 'v1';
+    const replaceId = e.target.dataset.replaceId || null;
+    const files = [...(e.target.files ?? [])];
+    const chosen = replaceId ? files.slice(0, 1) : files;
+    chosen.reduce((chain, file, index) =>
+      chain.then(() => app.importVideo(file, kind, index === 0 ? replaceId : null)), Promise.resolve());
+    e.target.dataset.kind = '';
+    e.target.dataset.replaceId = '';
+    e.target.value = '';
+  });
+  renderVideoChannels();
+}
+
+function maskRangeControl(label, value, min, max, step, format, onInput) {
+  const val = el('span', { class: 'text-[9px] text-zinc-500 font-mono' }, format(value));
+  return el('label', { class: 'block min-w-0' },
+    el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600 flex items-center justify-between' },
+      el('span', {}, label), val),
+    el('input', {
+      type: 'range', min, max, step, value, class: 'w-full',
+      onInput: e => {
+        const next = +e.target.value;
+        val.textContent = format(next);
+        onInput(next);
+      }
+    })
+  );
+}
+
+function renderVideoChannels() {
+  const host = $('#videoChannels');
+  if (!host || holdsFocus(host)) return;
+  host.replaceChildren();
+
+  const clipsByKind = Object.fromEntries(VIDEO_CHANNEL_KINDS.map(({ kind }) => [kind, videoClips(kind)]));
+  const loaded = VIDEO_CHANNEL_KINDS
+    .map(meta => ({ meta, count: clipsByKind[meta.kind].filter(clip => clip.ready).length }))
+    .filter(({ count }) => count > 0);
+  $('#videoChip').textContent = loaded.length
+    ? loaded.map(({ meta, count }) => `${meta.short}${count > 1 ? ` ×${count}` : ''}`).join(' · ')
+    : 'none';
+
+  const pick = (kind, replaceId = null) => {
+    const inp = $('#videoFile');
+    inp.dataset.kind = kind;
+    inp.dataset.replaceId = replaceId ?? '';
+    inp.multiple = !replaceId;
+    inp.click();
+  };
+
+  const effectOptions = selected => VIDEO_EFFECTS.map(effect =>
+    el('option', { value: effect.kind, selected: selected === effect.kind }, effect.label));
+
+  for (const meta of VIDEO_CHANNEL_KINDS) {
+    const lane = clipsByKind[meta.kind];
+    const pendingCount = lane.filter(clip => !clip.ready && clip.name).length;
+    const laneHead = el('div', { class: 'flex items-center gap-1.5' },
+      el('span', {
+        class: 'w-9 shrink-0 text-[9px] font-mono uppercase tracking-wider',
+        style: { color: lane.length ? meta.color : '#52596a' }
+      }, meta.short),
+      el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-500' },
+        lane.length
+          ? `${lane.length} clip${lane.length === 1 ? '' : 's'}${pendingCount ? ` · ${pendingCount} pending` : ''}`
+          : 'No backdrop clips'),
+      el('button', {
+        class: 'btn !py-1 !text-[10px]',
+        title: 'Import one or more backdrop videos into this lane',
+        onClick: () => pick(meta.kind)
+      }, lane.length ? '+ Add' : `Import ${meta.label.toLowerCase()}…`)
+    );
+
+    const clipCards = lane.map(clip => {
+      const ready = clip.ready && Number(clip.duration) > 0;
+      const shown = clip.visible !== false;
+      const duration = Math.max(0, Number(clip.duration) || 0);
+      const title = clip.name || 'Unattached backdrop video';
+      const head = el('div', { class: 'flex items-center gap-1.5' },
+        el('span', {
+          class: 'w-9 shrink-0 text-right text-[9px] font-mono',
+          style: { color: ready ? meta.color : '#52596a' },
+          title: ready ? `${fmtDur(duration)} loaded` : 'Source needs to be re-imported'
+        }, ready ? '●' : '○'),
+        el('span', {
+          class: 'flex-1 min-w-0 truncate text-[11px] ' + (ready ? 'text-zinc-300' : 'text-zinc-500'),
+          title
+        }, ready ? `${title} · ${fmtDur(duration)}` : `${title} · re-import to attach`),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6 ' + (shown ? '' : 'text-zinc-600'),
+          title: shown ? 'Hide this backdrop clip' : 'Show this backdrop clip',
+          onClick: () => setVideoClipSettings(meta.kind, clip.id, { visible: !shown })
+        }, shown ? '◉' : '○'),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6',
+          title: ready ? 'Replace this video source' : 'Attach this saved video source',
+          onClick: () => pick(meta.kind, clip.id)
+        }, ready ? '⤒' : '↗'),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400',
+          title: 'Remove this backdrop clip',
+          onClick: () => app.clearVideo(meta.kind, clip.id)
+        }, '✕')
+      );
+
+      const body = ready
+        ? (() => {
+            const mask = clip.mask ?? {};
+            const patchMask = patch => {
+              const current = videoClip(meta.kind, clip.id)?.mask ?? mask;
+              setVideoClipSettings(meta.kind, clip.id, { mask: { ...current, ...patch } });
+            };
+            const maskControls = el('div', {
+              class: 'space-y-1.5 pt-1.5 border-t border-line/60 ' +
+                     (mask.shape === 'none' ? 'hidden' : '')
+            });
+            const buildMaskControls = shape => {
+              const current = videoClip(meta.kind, clip.id)?.mask ?? mask;
+              const width = Number.isFinite(Number(current.width)) ? Number(current.width) : 0.72;
+              const height = Number.isFinite(Number(current.height)) ? Number(current.height) : 0.72;
+              const x = Number.isFinite(Number(current.x)) ? Number(current.x) : 0.5;
+              const y = Number.isFinite(Number(current.y)) ? Number(current.y) : 0.5;
+              const blur = Number.isFinite(Number(current.blur)) ? Number(current.blur) : 0;
+              maskControls.replaceChildren(
+                el('div', { class: 'grid grid-cols-2 gap-1.5' },
+                  maskRangeControl('Center X', x * 100, -50, 150, 1,
+                    value => `${Math.round(value)}%`, value => patchMask({ x: value / 100 })),
+                  maskRangeControl('Center Y', y * 100, -50, 150, 1,
+                    value => `${Math.round(value)}%`, value => patchMask({ y: value / 100 }))
+                ),
+                shape === 'circle'
+                  ? maskRangeControl('Size', Math.min(width, height) * 100,
+                      2, 200, 1, value => `${Math.round(value)}%`, value => patchMask({
+                        width: value / 100, height: value / 100
+                      }))
+                  : el('div', { class: 'grid grid-cols-2 gap-1.5' },
+                      maskRangeControl('Width', width * 100, 2, 200, 1,
+                        value => `${Math.round(value)}%`, value => patchMask({ width: value / 100 })),
+                      maskRangeControl('Height', height * 100, 2, 200, 1,
+                        value => `${Math.round(value)}%`, value => patchMask({ height: value / 100 }))
+                    ),
+                maskRangeControl('Edge blur', blur, 0, 200, 1,
+                  value => `${Math.round(value)}px`, value => patchMask({ blur: value }))
+              );
+            };
+            buildMaskControls(mask.shape);
+            const maskSelect = el('select', {
+              class: 'sel !py-0.5 !text-[10px] flex-1',
+              title: 'Clip this backdrop to a simple geometric shape',
+              onChange: e => {
+                const shape = e.target.value;
+                patchMask({ shape });
+                maskControls.classList.toggle('hidden', shape === 'none');
+                buildMaskControls(shape);
+              }
+            },
+              ...[['none', 'None'], ['rectangle', 'Rectangle'], ['circle', 'Circle']]
+                .map(([id, label]) => el('option', { value: id, selected: mask.shape === id }, label)));
+
+            const effectField = (label, effectKey, durationKey) => {
+              const effect = clip[effectKey] ?? 'none';
+              const effectDuration = clamp(Number(clip[durationKey]) || 0, 0, duration);
+              return el('div', { class: 'min-w-0' },
+                el('span', { class: 'lbl' }, `${label} effect`),
+                el('div', { class: 'flex items-center gap-1.5' },
+                  el('select', {
+                    class: 'sel !py-0.5 !text-[10px] flex-1 min-w-0',
+                    title: `${label} transition effect`,
+                    onChange: e => setVideoClipSettings(meta.kind, clip.id, { [effectKey]: e.target.value })
+                  }, ...effectOptions(effect)),
+                  el('input', {
+                    type: 'number', min: 0, max: Math.max(0.01, duration), step: '0.05',
+                    value: round(effectDuration, 2),
+                    class: 'inp !w-14 !py-0.5 !text-[10px] font-mono text-center',
+                    title: `${label} transition duration in seconds`,
+                    onChange: e => setVideoClipSettings(meta.kind, clip.id, {
+                      [durationKey]: clamp(+e.target.value || 0, 0, duration)
+                    })
+                  })
+                )
+              );
+            };
+
+            const opacityValue = clamp(Number(clip.opacity) || 0, 0, 1);
+            const opacityLabel = el('span', {
+              class: 'text-[9px] text-zinc-500 font-mono w-8 text-right'
+            }, `${Math.round(opacityValue * 100)}%`);
+            const opacityInput = el('input', {
+              type: 'range', min: 0, max: 1, step: 0.01, value: opacityValue,
+              class: 'flex-1', title: 'Backdrop opacity',
+              onInput: e => {
+                const value = +e.target.value;
+                opacityLabel.textContent = `${Math.round(value * 100)}%`;
+                setVideoClipSettings(meta.kind, clip.id, { opacity: value });
+              }
+            });
+            return el('div', { class: 'pl-9 space-y-1.5' },
+              el('div', { class: 'flex items-center gap-1.5' },
+                el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600 w-10' }, 'Opacity'),
+                el('div', { class: 'flex items-center gap-1.5 flex-1' }, opacityInput, opacityLabel)),
+              el('div', { class: 'flex items-center gap-1.5' },
+                el('input', {
+                  type: 'number', step: '0.05', value: round(clip.start, 2),
+                  class: 'inp !w-16 !py-0.5 !text-[10px] font-mono text-center',
+                  title: 'Start on the timeline — or drag the video region',
+                  onChange: e => setVideoClipStart(meta.kind, clip.id,
+                    clamp(+e.target.value || 0, -duration, state.project.duration))
+                }),
+                el('span', { class: 'text-[9px] text-zinc-600' }, 'start'),
+                el('select', {
+                  class: 'sel !py-0.5 !text-[10px] flex-1',
+                  title: 'How the video fills the frame',
+                  onChange: e => setVideoClipSettings(meta.kind, clip.id, { fit: e.target.value })
+                },
+                  ...[['cover', 'Cover'], ['contain', 'Contain'], ['stretch', 'Stretch']]
+                    .map(([id, label]) => el('option', { value: id, selected: clip.fit === id }, label)))
+              ),
+              el('label', { class: 'tog !text-[10px]' },
+                el('input', {
+                  type: 'checkbox', class: 'accent-sky-500', checked: clip.loop,
+                  onChange: e => setVideoClipSettings(meta.kind, clip.id, { loop: e.target.checked })
+                }), 'Loop when the source ends'),
+              el('div', { class: 'grid grid-cols-2 gap-1.5' },
+                effectField('In', 'inEffect', 'inDuration'),
+                effectField('Out', 'outEffect', 'outDuration')),
+              clip.loop && clip.outEffect === 'fade'
+                ? el('p', { class: 'text-[9px] text-zinc-600' }, 'Out fade is ignored while Loop is on.')
+                : null,
+              el('div', { class: 'flex items-center gap-1.5' },
+                el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600 w-10' }, 'Mask'),
+                maskSelect),
+              maskControls
+            );
+          })()
+        : el('p', { class: 'pl-9 text-[10px] leading-relaxed text-zinc-600' },
+            'Re-import the source to attach this saved clip; its timing and effects are preserved.');
+
+      return el('div', {
+        class: 'rounded-md border p-1.5 space-y-1 ' +
+               (ready ? 'border-line bg-base-900' : 'border-line/60 bg-base-900/40')
+      }, head, body);
+    });
+
+    host.append(el('div', {
+      class: 'rounded-md border p-1.5 space-y-1 ' +
+             (lane.length ? 'border-line bg-base-900/70' : 'border-line/60 bg-base-900/40')
+    }, laneHead, ...clipCards));
+  }
+}
+
+function syncVideoPanel() {
+  renderVideoChannels();
+}
+
 // ══ audio ════════════════════════════════════════════════════
 function buildAudioPanel() {
   $('#audioFile').addEventListener('change', e => {
-    const f = e.target.files?.[0];
-    if (f) app.importAudio(f, e.target.dataset.kind || 'bgm');
+    const kind = e.target.dataset.kind || 'bgm';
+    const files = [...(e.target.files ?? [])];
+    // Music stays a single source; VO/SFX may be inserted as a batch.
+    const chosen = kind === 'bgm' ? files.slice(0, 1) : files;
+    chosen.reduce((chain, file) => chain.then(() => app.importAudio(file, kind)), Promise.resolve());
     e.target.value = '';
   });
 
@@ -612,6 +1093,10 @@ function buildAudioPanel() {
   });
 
   $('#tSnap').addEventListener('change', e => { state.ui.snap = e.target.checked; });
+  $('#tSnapWords').addEventListener('change', e => {
+    state.ui.snapWords = e.target.checked;
+    app.timeline.draw();
+  });
   $('#tSnapPeaks').addEventListener('change', e => {
     state.ui.snapPeaks = e.target.checked;
     app.timeline.draw();
@@ -640,59 +1125,111 @@ function buildAudioPanel() {
 
 function renderAudioLanes() {
   const host = $('#audioLanes');
-  if (!host) return;
+  if (!host || holdsFocus(host)) return;      // a fader is being driven — leave it be
   host.replaceChildren();
 
   for (const meta of TRACK_KINDS) {
-    const tr = track(meta.kind);
-    const pick = () => { const inp = $('#audioFile'); inp.dataset.kind = meta.kind; inp.click(); };
+    const isBgm = meta.kind === 'bgm';
+    const tr = isBgm ? track('bgm') : null;
+    const lane = audioClips(meta.kind);
+    const loaded = lane.filter(clip => clip.ready);
+    const pick = () => {
+      const inp = $('#audioFile');
+      inp.dataset.kind = meta.kind;
+      inp.multiple = !isBgm;
+      inp.click();
+    };
 
     const head = el('div', { class: 'flex items-center gap-1.5' },
       el('span', {
         class: 'w-9 shrink-0 text-[9px] font-mono uppercase tracking-wider ' +
-               (tr.ready ? 'text-zinc-300' : 'text-zinc-600')
+               (loaded.length ? 'text-zinc-300' : 'text-zinc-600')
       }, meta.short),
-      tr.ready
+      isBgm && tr.ready
         ? el('span', { class: 'flex-1 min-w-0 truncate text-[11px] text-zinc-300', title: tr.name }, tr.name)
-        : el('button', { class: 'btn flex-1 !py-1 !text-[11px]', onClick: pick }, `Import ${meta.label.toLowerCase()}…`),
-      tr.ready ? el('button', {
+        : el('button', {
+          class: 'btn flex-1 !py-1 !text-[11px]', onClick: pick,
+          title: isBgm ? `Import ${meta.label.toLowerCase()}` : `Add another ${meta.label.toLowerCase()} clip`
+        }, isBgm ? `Import ${meta.label.toLowerCase()}…` : `${loaded.length ? 'Add' : 'Import'} ${meta.label.toLowerCase()}…`),
+      isBgm && tr.ready ? el('button', {
         class: 'btn btn-sq !w-6 !h-6 ' + (tr.mute ? '!text-red-400' : ''),
         title: tr.mute ? 'Unmute' : 'Mute',
         onClick: () => { setTrackLevel(meta.kind, { mute: !tr.mute }); renderAudioLanes(); app.timeline.draw(); }
       }, tr.mute ? '⨯' : '♪') : null,
-      tr.ready ? el('button', {
+      isBgm && tr.ready ? el('button', {
         class: 'btn btn-sq !w-6 !h-6', title: 'Replace', onClick: pick
       }, '⤒') : null,
-      tr.ready ? el('button', {
+      isBgm && tr.ready ? el('button', {
         class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Remove',
         onClick: () => app.clearAudio(meta.kind)
       }, '✕') : null
     );
 
-    const body = tr.ready
-      ? el('div', { class: 'flex items-center gap-1.5 pl-9' },
-          el('input', {
-            type: 'range', min: 0, max: 1.5, step: 0.01, value: tr.volume, class: 'flex-1',
-            title: 'Level',
-            onInput: e => setTrackLevel(meta.kind, { volume: +e.target.value })
-          }),
-          el('input', {
-            type: 'number', step: '0.05', value: round(tr.start, 2),
-            class: 'inp !w-16 !py-0.5 !text-[10px] font-mono text-center',
-            title: 'Start on the timeline — or drag the waveform',
-            onChange: e => {
-              setTrackStart(meta.kind, clamp(+e.target.value || 0, -tr.duration, state.project.duration));
-              emit('audio', state.audio);
-              app.timeline.draw();
-            }
-          }),
-          el('span', { class: 'text-[9px] text-zinc-600' }, 's'))
-      : null;
+    const body = loaded.map(clip => {
+      const controls = el('div', { class: 'pl-9 space-y-1.5' });
+      if (!isBgm) {
+        controls.append(el('div', { class: 'flex items-center gap-1.5' },
+          el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400', title: clip.name }, clip.name),
+          el('button', {
+            class: 'btn btn-sq !w-6 !h-6 ' + (clip.mute ? '!text-red-400' : ''),
+            title: clip.mute ? 'Unmute clip' : 'Mute clip',
+            onClick: () => { setAudioClipLevel(meta.kind, clip.id, { mute: !clip.mute }); renderAudioLanes(); app.timeline.draw(); }
+          }, clip.mute ? '⨯' : '♪'),
+          el('button', {
+            class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Remove clip',
+            onClick: () => app.clearAudio(meta.kind, clip.id)
+          }, '✕')
+        ));
+
+        if (meta.kind === 'vo') {
+          const words = Array.isArray(clip.words) ? clip.words : [];
+          const status = clip.speechStatus === 'analyzing'
+            ? 'Analysing…'
+            : words.length
+              ? `${words.length} words${clip.transcript ? ` · ${clip.transcript}` : ''}`
+              : clip.speechStatus === 'error' ? 'Analysis failed' : 'Not analysed';
+          controls.append(el('div', { class: 'flex items-center gap-1.5' },
+            el('span', {
+              class: 'flex-1 min-w-0 truncate text-[9px] text-zinc-600',
+              title: clip.speechError || clip.transcript || 'No word timing analysis yet'
+            }, status),
+            el('button', {
+              class: 'btn !py-0.5 !px-1.5 !text-[9px] shrink-0',
+              disabled: clip.speechStatus === 'analyzing',
+              title: 'Run local Whisper analysis and create word snap points',
+              onClick: () => app.analyzeVoice(meta.kind, clip.id)
+            }, words.length ? 'Re-analyse' : 'Analyse words')
+          ));
+        }
+      }
+      controls.append(el('div', { class: 'flex items-center gap-1.5' },
+        el('input', {
+          type: 'range', min: 0, max: 1.5, step: 0.01, value: clip.volume, class: 'flex-1',
+          title: `${meta.label} level`,
+          onInput: e => isBgm
+            ? setTrackLevel(meta.kind, { volume: +e.target.value })
+            : setAudioClipLevel(meta.kind, clip.id, { volume: +e.target.value })
+        }),
+        el('input', {
+          type: 'number', step: '0.05', value: round(clip.start, 2),
+          class: 'inp !w-16 !py-0.5 !text-[10px] font-mono text-center',
+          title: 'Start on the timeline — or drag the waveform',
+          onChange: e => {
+            const start = clamp(+e.target.value || 0, -clip.duration, state.project.duration);
+            if (isBgm) setTrackStart(meta.kind, start);
+            else setAudioClipStart(meta.kind, clip.id, start);
+            emit('audio', state.audio);
+            app.timeline.draw();
+          }
+        }),
+        el('span', { class: 'text-[9px] text-zinc-600' }, 's')));
+      return controls;
+    });
 
     host.append(el('div', {
       class: 'rounded-md border p-1.5 space-y-1 ' +
-             (tr.ready ? 'border-line bg-base-900' : 'border-line/60 bg-base-900/40')
-    }, head, body));
+             (loaded.length ? 'border-line bg-base-900' : 'border-line/60 bg-base-900/40')
+    }, head, ...body));
   }
 }
 
@@ -712,12 +1249,14 @@ export function setAudioProgress(v, label) {
 function syncAudioPanel() {
   const a = state.audio;
   const bgm = track('bgm');
-  const loaded = TRACK_KINDS.filter(k => track(k.kind).ready);
+  const loaded = TRACK_KINDS.map(meta => ({ meta, count: audioClips(meta.kind).filter(clip => clip.ready).length }))
+    .filter(({ count }) => count > 0);
 
   $('#audioChip').textContent = loaded.length
-    ? loaded.map(k => k.short).join(' · ')
+    ? loaded.map(({ meta, count }) => `${meta.short}${count > 1 ? ` ×${count}` : ''}`).join(' · ')
     : 'no audio';
   $('#audioInfo').classList.toggle('hidden', !bgm.ready);
+  $('#tSnapWords').checked = state.ui.snapWords;
   renderAudioLanes();
   if (!bgm.ready) return;
 
@@ -887,30 +1426,146 @@ const trim = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 // ══ camera ═══════════════════════════════════════════════════
 function buildCameraPanel() {
   $('#camEnabled').addEventListener('change', e => { setCameraEnabled(e.target.checked); app.timeline.draw(); });
+  $('#camSplit').addEventListener('change', e => {
+    setCameraMode(e.target.checked ? 'split' : 'combined');
+    app.timeline.draw();
+  });
   $('#btnCamKey').addEventListener('click', () => { addCameraKey(state.ui.time); app.timeline.draw(); });
   $('#btnCamClear').addEventListener('click', () => {
-    camera().keys.length = 0;
-    if (state.ui.sel?.type === 'camkey') select(null, null);
-    commitCameraKeys();
+    clearCameraTrack();
     app.timeline.draw();
     toast('Camera track cleared');
   });
+}
+
+const CAMERA_AXIS_META = {
+  x: { label: 'X', color: '#38bdf8' },
+  y: { label: 'Y', color: '#34d399' },
+  z: { label: 'Z', color: '#fbbf24' }
+};
+
+function cameraNowLabel(cam = camera()) {
+  const now = cameraAt(cam, state.ui.time, { width: state.project.width, height: state.project.height });
+  return `now  x ${now.position.x.toFixed(1)}   y ${now.position.y.toFixed(1)}   z ${now.position.z.toFixed(1)}   roll ${(now.roll * 180 / Math.PI).toFixed(1)}°`;
+}
+
+function splitCameraChannel(axis) {
+  const meta = CAMERA_AXIS_META[axis];
+  const keys = cameraChannelKeys(axis);
+  const list = el('div', { class: 'space-y-1' });
+  if (!keys.length) {
+    list.append(el('div', { class: 'text-[10px] text-zinc-600 py-1' }, 'No keys — holds the default framing.'));
+  }
+
+  for (const key of keys) {
+    const selected = selectedCamAxis() === axis && selectedCamKey()?.id === key.id;
+    const row = el('div', {
+      class: 'flex items-center gap-1 rounded border px-1.5 py-1 ' +
+             (selected ? 'border-zinc-300/60 bg-base-600' : 'border-line bg-base-900'),
+      onClick: () => selectCameraKey(axis, key.id)
+    },
+      el('span', { class: 'w-3 h-3 rotate-45 shrink-0', style: { background: meta.color } }),
+      el('input', {
+        type: 'number', step: '0.05', min: 0, max: state.project.duration,
+        value: round(key.t, 2), title: 'Key time',
+        class: 'inp !w-[70px] !py-0.5 !text-[10px] font-mono text-center',
+        onInput: e => {
+          updateCameraChannelKey(axis, key.id, { t: clamp(+e.target.value || 0, 0, state.project.duration) });
+          app.timeline.draw();
+        },
+        onBlur: () => renderCameraPanel()
+      }),
+      el('span', { class: 'text-[9px] text-zinc-600' }, 's'),
+      el('input', {
+        type: 'number', step: '0.1', value: round(key.value, 1), title: `${meta.label} value`,
+        class: 'inp flex-1 !py-0.5 !text-[10px] font-mono text-right',
+        onInput: e => {
+          updateCameraChannelKey(axis, key.id, { value: Number.isFinite(Number(e.target.value)) ? +e.target.value : 0 });
+          app.timeline.draw();
+        },
+        onBlur: () => renderCameraPanel()
+      }),
+      el('select', {
+        class: 'sel !w-[76px] !py-0.5 !text-[10px]', title: 'Easing out of this key',
+        onChange: e => { updateCameraChannelKey(axis, key.id, { ease: e.target.value }); app.timeline.draw(); }
+      }, ...Object.entries(EASES).map(([id, ease]) =>
+        el('option', { value: id, selected: key.ease === id }, ease.label))),
+      el('button', {
+        class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: `Delete ${meta.label} key`,
+        onClick: e => { e.stopPropagation(); removeCameraChannelKey(axis, key.id); app.timeline.draw(); }
+      }, '✕')
+    );
+    list.append(row);
+  }
+
+  return el('div', { class: 'rounded-md border border-line bg-base-900 p-1.5 space-y-1.5' },
+    el('div', { class: 'flex items-center gap-1.5' },
+      el('span', { class: 'w-5 h-5 rounded grid place-items-center text-[10px] font-bold',
+                   style: { color: '#08090c', background: meta.color } }, meta.label),
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-400 flex-1' },
+        `${meta.label} position · ${keys.length} key${keys.length === 1 ? '' : 's'}`),
+      el('button', {
+        class: 'btn !px-1.5 !py-1 !text-[10px]', title: `Add ${meta.label} key at the playhead`,
+        onClick: () => { addCameraChannelKey(axis, state.ui.time); app.timeline.draw(); }
+      }, '+ key'),
+      axis === 'z' ? el('button', {
+        class: 'btn !px-1.5 !py-1 !text-[10px]', title: 'Replace Z keys with a linear start-to-end move',
+        onClick: () => {
+          setCameraChannelSpan('z', 0, state.project.duration, 'linear');
+          app.timeline.draw();
+        }
+      }, 'Linear full span') : null
+    ),
+    list
+  );
+}
+
+function renderSplitCameraPanel(host) {
+  host.append(
+    el('div', { class: 'rounded-md bg-base-900 border border-line p-2 text-[10px] font-mono text-zinc-500' },
+      cameraNowLabel()),
+    el('p', { class: 'text-[10px] leading-snug text-zinc-600' },
+      'Each position axis has its own keys and easing. Add several X/Y keys, then use “Linear full span” on Z for a simple depth move.'),
+    ...['x', 'y', 'z'].map(splitCameraChannel),
+    el('div', { class: 'grid grid-cols-2 gap-1.5' },
+      el('button', {
+        class: 'btn', onClick: () => { addCameraKey(state.ui.time); app.timeline.draw(); }
+      }, 'Key all channels'),
+      el('button', {
+        class: 'btn', onClick: () => {
+          for (const axis of ['x', 'y', 'z']) setCameraChannelSpan(axis, 0, state.project.duration, 'linear');
+          // The helper selects Z last; keep the selected channel useful.
+          app.timeline.draw();
+        }
+      }, 'Linear all')
+    )
+  );
 }
 
 function renderCameraPanel() {
   const cam = camera();
   const keys = cameraKeys();
   $('#camEnabled').checked = cam.enabled;
-  $('#camChip').textContent = keys.length ? `${keys.length} key${keys.length === 1 ? '' : 's'}` : 'no keys';
+  $('#camSplit').checked = cameraMode() === 'split';
+  const count = cameraKeyCount();
+  $('#camChip').textContent = count
+    ? cameraMode() === 'split' ? `${count} axis key${count === 1 ? '' : 's'}` : `${count} key${count === 1 ? '' : 's'}`
+    : 'no keys';
 
   const host = $('#camKeyPanel');
+  if (holdsFocus(host)) return;               // a slider is being driven — leave it be
   host.replaceChildren();
+
+  if (cameraMode() === 'split') {
+    renderSplitCameraPanel(host);
+    return;
+  }
+
   const key = selectedCamKey();
 
   if (!key) {
-    const now = cameraAt(cam, state.ui.time);
     host.append(el('div', { class: 'rounded-md bg-base-900 border border-line p-2 text-[10px] font-mono text-zinc-500' },
-      `now  x ${now.x.toFixed(3)}   y ${now.y.toFixed(3)}   zoom ${now.zoom.toFixed(2)}   roll ${(now.roll * 180 / Math.PI).toFixed(1)}°`));
+      cameraNowLabel(cam)));
     if (keys.length) {
       host.append(el('p', { class: 'text-[10px] text-zinc-600' }, 'Select a key on the CAM track to edit it.'));
     }
@@ -933,9 +1588,8 @@ function renderCameraPanel() {
       onChange: e => { upd({ t: clamp(+e.target.value || 0, 0, state.project.duration) }); renderCameraPanel(); }
     })),
 
-    slider('Pan X', key.x, -1, 1, 0.005, v => upd({ x: v }), 'of frame'),
-    slider('Pan Y', key.y, -1, 1, 0.005, v => upd({ y: v }), 'of frame'),
-    slider('Zoom', key.zoom, 0.2, 4, 0.01, v => upd({ zoom: v })),
+    field('Position · scene units', positionFields(key.position,
+      pos => upd({ position: { ...(key.position ?? {}), ...pos } }))),
     slider('Roll', key.roll * 180 / Math.PI, -180, 180, 0.5, v => upd({ roll: v * Math.PI / 180 }), '°'),
 
     field('Easing out of this key', el('select', {
@@ -945,7 +1599,213 @@ function renderCameraPanel() {
 
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
       el('button', { class: 'btn', onClick: () => app.seek(key.t) }, 'Go to key'),
-      el('button', { class: 'btn', onClick: () => { upd({ ...CAMERA_REST }); renderCameraPanel(); } }, 'Reset framing'))
+      el('button', {
+        class: 'btn',
+        onClick: () => {
+          upd({ position: defaultCameraPosition(state.project.width, state.project.height), roll: 0 });
+          renderCameraPanel();
+        }
+      }, 'Reset position'))
+  );
+}
+
+// ══ viewport ═════════════════════════════════════════════════
+function buildViewport() {
+  const choose = mode => {
+    if (state.ui.viewMode === mode) return;
+    state.ui.viewMode = mode;
+    emit('view', mode);
+    emit('render');
+  };
+  $('#viewOutput').addEventListener('click', () => choose('output'));
+  $('#viewSpace').addEventListener('click', () => choose('space'));
+}
+
+function syncViewMode() {
+  const mode = state.ui.viewMode === 'space' ? 'space' : 'output';
+  state.ui.viewMode = mode;
+  for (const [id, value] of [['#viewOutput', 'output'], ['#viewSpace', 'space']]) {
+    const button = $(id);
+    if (!button) continue;
+    const active = mode === value;
+    button.classList.toggle('view-mode-active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+  $('#spaceHint')?.classList.toggle('hidden', mode !== 'space');
+  $('#safeToggle')?.classList.toggle('hidden', mode === 'space');
+  $('#safeArea')?.classList.toggle('hidden', mode !== 'output' || !state.ui.safeArea);
+}
+
+// ══ particles ════════════════════════════════════════════════
+function buildParticlePanel() {
+  $('#btnAddEmitter').addEventListener('click', () => {
+    if (!addParticleEmitter()) toast(`At most ${MAX_EMITTERS} emitters`);
+  });
+  $('#btnDupEmitter').addEventListener('click', () => {
+    const e = selectedEmitter();
+    if (!e) { toast('Add an emitter first'); return; }
+    if (!duplicateParticleEmitter(e.id)) toast(`At most ${MAX_EMITTERS} emitters`);
+  });
+  renderParticlePanel();
+}
+
+// Blur first: a select still holding focus would block the panel rebuild that
+// swaps the controls belonging to the newly chosen mode.
+const selectField = (label, value, options, onChange) =>
+  field(label, el('select', {
+    class: 'sel',
+    onChange: e => { const v = e.target.value; e.target.blur(); onChange(v); }
+  }, ...options.map(o => el('option', { value: o.id, selected: o.id === value }, o.label))));
+
+const colorField = (label, value, onChange) =>
+  field(label, el('input', {
+    type: 'color', value,
+    class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
+    onInput: e => onChange(e.target.value)
+  }));
+
+const emitterLabel = (e, i) =>
+  e.name || `${PARTICLE_SHAPES.find(s => s.id === e.shape)?.label ?? e.shape} ${i + 1}`;
+
+function renderEmitterList() {
+  const host = $('#emitterList');
+  if (!host) return;
+  const list = particleEmitters();
+  const current = selectedEmitter();
+  const on = list.filter(e => e.on).length;
+  $('#particleChip').textContent = list.length
+    ? `${list.length} emitter${list.length === 1 ? '' : 's'}${on === list.length ? '' : ` · ${on} on`}`
+    : 'none';
+
+  host.replaceChildren();
+  list.forEach((e, i) => host.append(el('div', {
+    class: 'stage-row' + (current?.id === e.id ? ' is-active' : ''),
+    style: { '--role': e.colorA },
+    onClick: () => selectEmitter(e.id)
+  },
+    el('span', {
+      class: 'w-1 h-5 rounded-full shrink-0',
+      style: { background: e.on ? e.colorA : '#3f4653' }
+    }),
+    el('span', { class: 'flex-1 min-w-0' },
+      el('div', { class: 'truncate text-[11px] leading-tight ' + (e.on ? 'text-zinc-300' : 'text-zinc-600') },
+        emitterLabel(e, i)),
+      el('div', { class: 'text-[9px] font-mono text-zinc-600 leading-tight' },
+        `${e.start.toFixed(2)}–${e.end.toFixed(2)}s · ${Math.round(e.rate)}/s · ` +
+        `${PARTICLE_ORIGINS.find(o => o.id === e.origin)?.label ?? e.origin}`)),
+    el('input', {
+      type: 'checkbox', class: 'accent-amber-500 shrink-0', checked: e.on,
+      title: 'Mute this emitter',
+      onClick: ev => ev.stopPropagation(),
+      onChange: ev => updateEmitter(e.id, { on: ev.target.checked })
+    }),
+    el('button', {
+      class: 'btn btn-ghost !px-1 !py-0.5 text-zinc-600 hover:text-red-400 shrink-0',
+      title: 'Delete emitter',
+      onClick: ev => { ev.stopPropagation(); removeParticleEmitter(e.id); }
+    }, '✕')
+  )));
+
+  if (!list.length) {
+    host.append(el('p', { class: 'text-[10px] text-zinc-600 py-2 text-center' },
+      'No emitters yet — add one to start shedding particles.'));
+  }
+}
+
+/** Start / end of one emitter's window, with in- and out-points at the playhead. */
+function emitterWindow(s) {
+  const timeInput = (key, min, max) => el('input', {
+    type: 'number', step: '0.05', min, max, value: round(s[key], 2),
+    class: 'inp !py-1 font-mono text-[11px]',
+    onChange: e => {
+      const v = Number(e.target.value);
+      updateEmitter(s.id, Number.isFinite(v) ? { [key]: v } : {});
+    }
+  });
+  return el('div', {},
+    el('span', { class: 'lbl' }, 'Live from → to'),
+    el('div', { class: 'grid grid-cols-2 gap-1.5' },
+      timeInput('start', 0, state.project.duration),
+      timeInput('end', 0.05, state.project.duration)),
+    el('div', { class: 'grid grid-cols-2 gap-1.5 mt-1.5' },
+      el('button', {
+        class: 'btn !py-1 !text-[10px]', title: 'Open this emitter at the playhead',
+        onClick: () => updateEmitter(s.id, { start: Math.min(state.ui.time, s.end - 0.05) })
+      }, 'In at playhead'),
+      el('button', {
+        class: 'btn !py-1 !text-[10px]', title: 'Close this emitter at the playhead',
+        onClick: () => updateEmitter(s.id, { end: Math.max(state.ui.time, s.start + 0.05) })
+      }, 'Out at playhead')));
+}
+
+function renderParticlePanel() {
+  renderEmitterList();
+  const host = $('#particlePanel');
+  if (!host || holdsFocus(host)) return;      // never rebuild under a dragged slider
+
+  const s = selectedEmitter();
+  host.replaceChildren();
+  if (!s) return;
+
+  const set = props => updateEmitter(s.id, props);
+  const sl = (label, key, min, max, step, hint = null) =>
+    slider(label, s[key], min, max, step, v => set({ [key]: v }), hint);
+
+  const directional = s.origin !== 'area' && s.origin !== 'outline';
+
+  host.append(
+    el('div', { class: 'pt-1 border-t border-line/70' },
+      field('Name', el('input', {
+        class: 'inp', value: s.name, spellcheck: 'false', placeholder: 'Emitter',
+        onChange: e => set({ name: e.target.value })
+      }))),
+
+    emitterWindow(s),
+
+    el('div', { class: 'grid grid-cols-2 gap-2' },
+      selectField('Shape', s.shape, PARTICLE_SHAPES, v => set({ shape: v })),
+      selectField('Born from', s.origin, PARTICLE_ORIGINS, v => set({ origin: v }))),
+
+    field(s.origin === 'point' ? 'Emitter position' : 'Emitter offset',
+      positionFields(s, props => set(props))),
+
+    sl('Rate', 'rate', 0, 400, 1, 'per second'),
+    sl('Burst on beat', 'burst', 0, 200, 1),
+    sl('Lifetime', 'life', 0.1, 6, 0.05, 'seconds'),
+    sl('Size', 'size', 0.5, 120, 0.5),
+    sl('Speed', 'speed', 0, 2000, 5),
+    directional ? sl('Direction', 'direction', 0, 360, 1, 'degrees') : null,
+    sl('Spread', 'spread', 0, 1, 0.01),
+    sl('Gravity', 'gravity', -1500, 1500, 5),
+    sl('Wind', 'wind', -1500, 1500, 5),
+    sl('Drag', 'drag', 0, 6, 0.01),
+    sl('Turbulence', 'turbulence', 0, 800, 1),
+    sl('Spin', 'spin', 0, 12, 0.05),
+    sl('Depth spread', 'spawnDepth', 0, 2000, 5),
+
+    el('div', { class: 'grid grid-cols-2 gap-2' },
+      colorField('Newborn', s.colorA, v => set({ colorA: v })),
+      colorField('Dying', s.colorB, v => set({ colorB: v }))),
+    sl('Opacity', 'opacity', 0, 1, 0.01),
+    el('label', { class: 'tog' },
+      el('input', {
+        type: 'checkbox', class: 'accent-amber-500', checked: s.additive,
+        onChange: e => set({ additive: e.target.checked })
+      }), ' Additive blending'),
+
+    el('div', { class: 'pt-1.5 border-t border-line/70 space-y-2.5' },
+      selectField('Text outlines', s.textMode, TEXT_MODES, v => set({ textMode: v })),
+      s.textMode === 'none' ? null : sl('Influence radius', 'textRadius', 4, 600, 1),
+      s.textMode === 'collide' ? sl('Bounce', 'bounce', 0, 1, 0.01) : null,
+      s.textMode === 'none' || s.textMode === 'collide' ? null : sl('Force', 'textForce', 0, 6000, 10),
+      el('p', { class: 'text-[10px] leading-relaxed text-zinc-600' },
+        'Particles read the live glyph contours — counters and every stroke included — so they answer to whatever the effects are doing to the letterforms at that moment.')),
+
+    el('div', { class: 'flex gap-1.5' },
+      el('button', {
+        class: 'btn flex-1',
+        onClick: () => set({ seed: 1 + Math.floor(Math.random() * 999999) })
+      }, 'Reseed'))
   );
 }
 
@@ -972,7 +1832,7 @@ function buildLookPanel() {
 
   $('#tSafe').addEventListener('change', e => {
     state.ui.safeArea = e.target.checked;
-    $('#safeArea').classList.toggle('hidden', !e.target.checked);
+    syncViewMode();
   });
 }
 
@@ -1006,14 +1866,38 @@ function syncTime() {
 // ══ keyboard ═════════════════════════════════════════════════
 function buildShortcuts() {
   window.addEventListener('keydown', e => {
-    const tag = document.activeElement?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const active = document.activeElement;
+    const tag = active?.tagName;
+    const isSlider = tag === 'INPUT' && active.type === 'range';
+
+    // text fields and menus swallow everything
+    if (tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && !isSlider)) return;
+
+    // a focused slider owns the arrow keys; Esc hands the keyboard back to the
+    // timeline, and space still plays because a range does nothing with it
+    if (isSlider) {
+      if (e.key === 'Escape') { e.preventDefault(); active.blur(); }
+      else if (e.key === ' ') { e.preventDefault(); app.togglePlay(); }
+      return;
+    }
+
     const frame = 1 / state.project.fps;
     const clip = selectedClip();
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
       e.preventDefault();
       if (clip) duplicateClip(clip.id);
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c') {
+      if (!clip) return;
+      e.preventDefault();
+      copySelectedClipToClipboard();
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v' && clipClipboard) {
+      e.preventDefault();
+      pasteClipData(clipClipboard);
       return;
     }
     switch (e.key) {
@@ -1033,7 +1917,7 @@ function buildShortcuts() {
       }
       case 'Backspace': case 'Delete': {
         const ck = selectedCamKey();
-        if (ck) { e.preventDefault(); removeCameraKey(ck.id); app.timeline.draw(); }
+        if (ck) { e.preventDefault(); removeCameraKey(ck.id, selectedCamAxis()); app.timeline.draw(); }
         else if (clip) { e.preventDefault(); removeClip(clip.id); }
         break;
       }

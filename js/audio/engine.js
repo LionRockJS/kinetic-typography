@@ -1,8 +1,9 @@
 // Audio decoding, analysis hand-off and the transport clock.
 //
-// Three independent lanes play together: the music, a voiceover and sound
-// effects. Each has its own buffer, its own position on the timeline, and its
-// own level, so they can be slipped against each other freely.
+// Three independent lanes play together: one music source, plus any number of
+// voiceover and sound-effects clips. Each clip has its own buffer, position,
+// and level, so clips can be slipped against each other freely. VO sources
+// can also be copied out as mono data for the optional word-timing worker.
 //
 // The transport rides the AudioContext while audio is genuinely running, so the
 // playhead cannot drift against the track. A context that has not been resumed
@@ -26,9 +27,9 @@ export class AudioEngine {
     this._t0 = 0;             // clock reading at that moment
     this._audioClock = false; // which clock _t0 was read from
 
-    /** @type {Map<string, {buffer:AudioBuffer|null, gain:GainNode|null, source:AudioBufferSourceNode|null, start:number, volume:number, mute:boolean}>} */
+    /** @type {Map<string, Map<string, {buffer:AudioBuffer|null, gain:GainNode|null, source:AudioBufferSourceNode|null, start:number, volume:number, mute:boolean}>>} */
     this.tracks = new Map(
-      TRACK_KINDS.map(t => [t.kind, { buffer: null, gain: null, source: null, start: 0, volume: 1, mute: false }])
+      TRACK_KINDS.map(t => [t.kind, new Map()])
     );
   }
 
@@ -41,11 +42,13 @@ export class AudioEngine {
       this.master.connect(this.streamDest);
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
-    for (const tr of this.tracks.values()) {
-      if (!tr.gain) {
-        tr.gain = this.ctx.createGain();
-        tr.gain.gain.value = tr.mute ? 0 : tr.volume;
-        tr.gain.connect(this.master);
+    for (const lane of this.tracks.values()) {
+      for (const tr of lane.values()) {
+        if (!tr.gain) {
+          tr.gain = this.ctx.createGain();
+          tr.gain.gain.value = tr.mute ? 0 : tr.volume;
+          tr.gain.connect(this.master);
+        }
       }
     }
     return this.ctx;
@@ -70,32 +73,63 @@ export class AudioEngine {
   }
 
   // ── tracks ─────────────────────────────────────────────────
-  track(kind) { return this.tracks.get(kind); }
+  track(kind, id = null) {
+    const lane = this.tracks.get(kind);
+    if (!lane) return null;
+    const key = id ?? (kind === 'bgm' ? 'bgm' : lane.keys().next().value);
+    return key === undefined ? null : lane.get(key) ?? null;
+  }
 
-  setBuffer(kind, buffer) {
-    const tr = this.track(kind);
+  _ensureTrack(kind, id = null) {
+    const lane = this.tracks.get(kind);
+    if (!lane) return null;
+    const key = id ?? (kind === 'bgm' ? 'bgm' : null);
+    if (key === null) return null;
+    if (!lane.has(key)) lane.set(key, { buffer: null, gain: null, source: null, start: 0, volume: 1, mute: false });
+    return lane.get(key);
+  }
+
+  setBuffer(kind, buffer, id = null) {
+    const tr = this._ensureTrack(kind, id);
     if (!tr) return;
     this._stopSource(tr);
     tr.buffer = buffer;
-    if (this.playing) this.play();
+    this._ensureCtx();
   }
 
-  setStart(kind, t) {
-    const tr = this.track(kind);
+  setStart(kind, t, id = null) {
+    const tr = this._ensureTrack(kind, id);
     if (!tr) return;
     tr.start = t;
-    if (this.playing) this.play();
   }
 
-  setLevel(kind, { volume, mute }) {
-    const tr = this.track(kind);
+  setLevel(kind, { volume, mute }, id = null) {
+    const tr = this._ensureTrack(kind, id);
     if (!tr) return;
     if (volume !== undefined) tr.volume = volume;
     if (mute !== undefined) tr.mute = mute;
+    if (!tr.gain && this.ctx) this._ensureCtx();
     if (tr.gain) tr.gain.gain.value = tr.mute ? 0 : tr.volume;
   }
 
-  get loaded() { return [...this.tracks.values()].some(t => t.buffer); }
+  /** Return a fresh mono copy of a loaded source for speech analysis. */
+  getSourceData(kind, id = null) {
+    const tr = this.track(kind, id);
+    const buffer = tr?.buffer;
+    if (!buffer) return null;
+    const mono = new Float32Array(buffer.length);
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      const data = buffer.getChannelData(c);
+      for (let i = 0; i < buffer.length; i++) mono[i] += data[i];
+    }
+    if (buffer.numberOfChannels > 1) {
+      const scale = 1 / buffer.numberOfChannels;
+      for (let i = 0; i < mono.length; i++) mono[i] *= scale;
+    }
+    return { mono, sampleRate: buffer.sampleRate, duration: buffer.duration };
+  }
+
+  get loaded() { return [...this.tracks.values()].some(lane => [...lane.values()].some(t => t.buffer)); }
 
   // ── transport ──────────────────────────────────────────────
   play(from = null) {
@@ -103,16 +137,18 @@ export class AudioEngine {
     const ctx = this._ensureCtx();
     this._stopAll();
 
-    for (const tr of this.tracks.values()) {
-      if (!tr.buffer) continue;
-      const at = this._base - tr.start;              // position inside this buffer
-      if (at >= tr.buffer.duration) continue;
-      const src = ctx.createBufferSource();
-      src.buffer = tr.buffer;
-      src.connect(tr.gain);
-      if (at >= 0) src.start(0, at);
-      else src.start(ctx.currentTime - at, 0);        // this lane has not begun yet
-      tr.source = src;
+    for (const lane of this.tracks.values()) {
+      for (const tr of lane.values()) {
+        if (!tr.buffer) continue;
+        const at = this._base - tr.start;              // position inside this buffer
+        if (at >= tr.buffer.duration) continue;
+        const src = ctx.createBufferSource();
+        src.buffer = tr.buffer;
+        src.connect(tr.gain);
+        if (at >= 0) src.start(0, at);
+        else src.start(ctx.currentTime - at, 0);        // this lane has not begun yet
+        tr.source = src;
+      }
     }
 
     this._audioClock = this.audible;
@@ -140,14 +176,24 @@ export class AudioEngine {
     tr.source = null;
   }
 
-  _stopAll() { for (const tr of this.tracks.values()) this._stopSource(tr); }
+  _stopAll() {
+    for (const lane of this.tracks.values()) {
+      for (const tr of lane.values()) this._stopSource(tr);
+    }
+  }
 
-  clearTrack(kind) {
-    const tr = this.track(kind);
-    if (!tr) return;
-    this._stopSource(tr);
-    tr.buffer = null;
-    tr.start = 0;
+  clearTrack(kind, id = null) {
+    const lane = this.tracks.get(kind);
+    if (!lane) return;
+    if (id !== null) {
+      const tr = lane.get(id);
+      if (!tr) return;
+      this._stopSource(tr);
+      lane.delete(id);
+      return;
+    }
+    for (const tr of lane.values()) this._stopSource(tr);
+    lane.clear();
   }
 
   /** Decode a File into an AudioBuffer, plus a mono mixdown for analysis. */

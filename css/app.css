@@ -25,6 +25,10 @@ input[type="range"]::-webkit-slider-thumb {
 }
 input[type="range"]::-webkit-slider-thumb:hover { background: #fff; transform: scale(1.12); }
 input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; transform: scale(0.96); }
+/* a focused slider owns the arrow keys, so make it obvious which one has them */
+input[type="range"]:focus { box-shadow: 0 0 0 2px #0d0f14, 0 0 0 3px #38bdf8aa; }
+input[type="range"]:focus::-webkit-slider-thumb { background: #fff; box-shadow: 0 0 0 1px #38bdf8; }
+
 input[type="range"]::-moz-range-thumb {
   width: 13px; height: 13px; border-radius: 50%; background: #e4e8ef;
   border: 2px solid #0d0f14; box-shadow: 0 0 0 1px #38455c; cursor: grab;
@@ -87,3 +91,12 @@ input[type="number"] { -moz-appearance: textfield; }
 .is-recording { animation: recpulse 1s ease-in-out infinite; }
 
 #timelineCanvas { touch-action: none; }
+
+/* ── viewport mode switch ────────────────────────────────── */
+.view-mode-active {
+  background: #7c3aed !important;
+  color: #fff !important;
+  box-shadow: 0 0 0 1px #a78bfa88 inset;
+}
+
+#stageCanvas { touch-action: none; }

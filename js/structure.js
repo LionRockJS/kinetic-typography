@@ -239,6 +239,41 @@ export function scaleRange(level, snapshot, i0, i1, moving, t, min = MIN_REGION)
   return tt;
 }
 
+/**
+ * Rescale a run about a chosen centre rather than about its far end: the point
+ * at `pivot` holds still and everything else in the run moves away from it or
+ * toward it in proportion, so dragging one edge grows the run from both sides.
+ *
+ * @param {number} moving index of the point being dragged
+ * @param {number} pivot  index of the point that holds still
+ * @param {number} t      where the dragged point wants to land
+ * @returns {number} where the dragged point actually landed
+ */
+export function scaleAboutPivot(level, snapshot, i0, i1, moving, pivot, t, min = MIN_REGION) {
+  const gs = level.guides;
+  const P = snapshot[pivot];
+  const reach = snapshot[moving] - P;
+  if (Math.abs(reach) < 1e-6) return P;         // dragging the centre itself scales nothing
+
+  // every gap scales by the same factor, so the tightest one sets the floor
+  let minGap = Infinity;
+  for (let j = i0; j < i1; j++) minGap = Math.min(minGap, snapshot[j + 1] - snapshot[j]);
+  const kLo = minGap > 0 && minGap < Infinity ? Math.max(0.01, min / minGap) : 0.01;
+
+  // and the neighbours outside the run set the ceiling, on whichever side reaches them first
+  const leftLimit = (snapshot[i0 - 1] ?? level.start) + min;
+  const rightLimit = (snapshot[i1 + 1] ?? level.end) - min;
+  const dL = snapshot[i0] - P, dR = snapshot[i1] - P;
+  let kHi = Infinity;
+  if (dL < -1e-9) kHi = Math.min(kHi, (leftLimit - P) / dL);
+  if (dR > 1e-9) kHi = Math.min(kHi, (rightLimit - P) / dR);
+
+  const k = clamp((t - P) / reach, kLo, Math.max(kLo, kHi));
+  for (let j = i0; j <= i1; j++) gs[j].t = P + (snapshot[j] - P) * k;
+  normalizeGuides(level, min);
+  return P + reach * k;
+}
+
 /** Slide a run of points rigidly, clamped by the points on either side of it. */
 export function translateRange(level, snapshot, i0, i1, delta, min = MIN_REGION) {
   const gs = level.guides;
@@ -250,14 +285,100 @@ export function translateRange(level, snapshot, i0, i1, delta, min = MIN_REGION)
   return d;
 }
 
-/** Even spacing for a run of points across the span it already occupies. */
-export function distributeRange(level, i0, i1, min = MIN_REGION) {
+/**
+ * Curves used to place a run of selected points across its existing span.
+ *
+ * The curve receives a normalized point index (0..1) and returns the point's
+ * normalized time. Linear left/right are quadratic bias curves: their gap
+ * sizes change steadily across the span. Ease in/out use the stronger cubic
+ * version of the same bias. Bell shape keeps the points closest together in
+ * the middle and opens the gaps toward either end.
+ */
+export const DISTRIBUTIONS = {
+  even: {
+    label: 'Even',
+    description: 'Equal spacing across the selected span.',
+    curve: t => t
+  },
+  'linear-left': {
+    label: 'Linear left',
+    description: 'Gaps grow toward the right, weighting points to the left.',
+    curve: t => t ** 2
+  },
+  'linear-right': {
+    label: 'Linear right',
+    description: 'Gaps shrink toward the right, weighting points to the right.',
+    curve: t => 1 - (1 - t) ** 2
+  },
+  bell: {
+    label: 'Bell shape',
+    description: 'Tightest around the middle, with wider gaps at the ends.',
+    // The derivative stays positive, so the curve can never fold points over.
+    curve: t => clamp(t + 0.72 * Math.sin(2 * Math.PI * t) / (2 * Math.PI), 0, 1)
+  },
+  'ease-in': {
+    label: 'Ease in',
+    description: 'Starts compact and accelerates toward the right.',
+    curve: t => t ** 3
+  },
+  'ease-out': {
+    label: 'Ease out',
+    description: 'Starts quickly and settles compactly toward the right.',
+    curve: t => 1 - (1 - t) ** 3
+  }
+};
+
+/**
+ * Place a run of points across its current span using a chosen distribution.
+ * If a strong curve would make one gap smaller than `min`, it blends toward
+ * even spacing just enough to keep the curve valid rather than rejecting it.
+ */
+export function distributeRange(level, i0, i1, mode = 'even', min = MIN_REGION) {
+  // Keep the original four-argument form working for callers that pass only a
+  // custom minimum spacing: distributeRange(level, i0, i1, min).
+  if (typeof mode === 'number') { min = mode; mode = 'even'; }
+
   const gs = level.guides;
   if (i1 - i0 < 2) return false;
   const a = gs[i0].t, b = gs[i1].t;
-  const step = (b - a) / (i1 - i0);
-  if (step < min) return false;
-  for (let j = i0 + 1; j < i1; j++) gs[j].t = a + step * (j - i0);
+  const curve = DISTRIBUTIONS[mode]?.curve ?? DISTRIBUTIONS.even.curve;
+  const count = i1 - i0;
+  const span = b - a;
+  const evenGap = span / count;
+  if (evenGap < min) return false;
+
+  const desired = Array.from({ length: count + 1 }, (_, j) => {
+    const u = j / count;
+    return j === 0 || j === count ? u : clamp(curve(u), 0, 1);
+  });
+
+  // Blend a curve toward the even layout if its smallest desired gap would
+  // cross the minimum. The blend keeps the selected endpoints fixed and
+  // preserves the requested bias as strongly as the guide spacing allows.
+  const evenNorm = 1 / count;
+  const minNorm = min / span;
+  let strength = 1;
+  for (let j = 1; j < desired.length; j++) {
+    const gap = desired[j] - desired[j - 1];
+    if (gap < evenNorm) {
+      strength = Math.min(strength, (evenNorm - minNorm) / (evenNorm - gap));
+    }
+  }
+  strength = clamp(strength, 0, 1);
+
+  const positions = desired.map((u, j) => {
+    if (j === 0) return a;
+    if (j === count) return b;
+    const even = j / count;
+    return a + span * (even + (u - even) * strength);
+  });
+
+  // The blend above is analytic; retain a guard for custom curves and
+  // floating-point edge cases so no invalid layout can reach the store.
+  for (let j = 1; j < positions.length; j++) {
+    if (positions[j] - positions[j - 1] + 1e-9 < min) return false;
+  }
+  for (let j = 1; j < count; j++) gs[i0 + j].t = positions[j];
   normalizeGuides(level, min);
   return true;
 }

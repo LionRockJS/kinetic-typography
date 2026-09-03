@@ -3,8 +3,50 @@
 A browser-based composer for beat-driven kinetic typography, built around the
 classical 起承轉合 dramatic structure.
 
-Plain HTML + vanilla ES modules + Tailwind (play CDN).
-Glyph outlines come from **opentype.js**; every effect runs in **three.js**.
+Plain HTML + vanilla ES modules + Tailwind (play CDN). No build step.
+Glyph outlines come from **opentype.js 1.3.4**; every effect runs in
+**three.js 0.170**; beat analysis runs in a Web Worker.
+
+---
+
+## Status
+
+Everything below is implemented and working in the browser. There is no build
+step; the editor uses the two display/geometry CDN libraries above, and loads
+the optional speech runtime/model only when VO analysis is requested.
+
+| Area | State |
+|---|---|
+| 起承轉合 reference lines | two levels (overall + animation), merged 起承 handle, ratio scaling, multi-select runs, non-destructive pair insertion |
+| Text layers | 3 tracks, unlimited simultaneous clips, 20 effects, per-clip 3D position and beat reaction |
+| Camera | keyframed 3D position / roll with easing, on its own track |
+| Audio | 3 lanes (BGM · VO · SFX), each slippable, with level, mute, and optional VO word timing |
+| Backdrop video | 3 visual channels, each holding multiple clips with independent timing, opacity / fit / loop / mask / In-Out fades |
+| Beat analysis | STFT → spectral flux → adaptive peaks → autocorrelation tempo → phase-locked grid |
+| Peaks | transient detection with spacing and sensitivity thresholds, snappable |
+| Metronome | synthesised click bus, 3 voices, track-follow or manual BPM with tap tempo |
+| Typography | 3-slot fallback stack, browser-measured kerning, CJK-correct counters |
+| Export | real-time WebM capture, `.ktc.json` project save/load |
+
+**Measured accuracy.** Tempo detection was checked against synthetic click
+tracks at 90 / 120 / 140 BPM and returned 89.97 / 120.07 / 140.01 BPM with the
+downbeat phase correct to within a frame. On a 120 BPM import the app read
+120.1 BPM and *Fit to music* landed every reference line on a bar.
+
+**Known limits.**
+
+- Recording is real time — a 60 s piece takes 60 s to capture. There is no
+  offline frame-by-frame render.
+- Audio and backdrop settings are retained in a saved project, but their source
+  files are referenced by name rather than embedded, so sources must be
+  re-imported after opening a file.
+- The timeline collapses unused audio and backdrop lanes: it is about 258 px
+  with neither loaded and grows to ~428 px when every media lane is visible;
+  on a short screen the stage viewport gets tight.
+- BGM is one analysed source; VO and SFX lanes can contain multiple independent clips.
+- VO word timing is model-based and approximate; review the waveform and adjust
+  the text clip edges when a word is misrecognised or a pause is ambiguous.
+- Backdrop videos are visual-only and muted; video sound must be imported to an audio lane.
 
 ---
 
@@ -24,7 +66,10 @@ no-cache headers and the right MIME types for local development.
 
 ## The model
 
-Two independent things live in a composition.
+Five independent things live in a composition: the **reference lines** that give
+it shape, the **layers** that render, the **camera** that frames them, the
+**backdrop video** behind them, and the **audio** they are cut against. None of
+them owns any of the others.
 
 ### 起承轉合 — reference lines, at two levels
 
@@ -90,15 +135,35 @@ select several reference lines at once. Then:
 - dragging a point **inside** the run slides the whole run rigidly
 - points **outside** the run never move
 
+### Scaling about a centre
+
+**Click** any point of the run — no drag — to make it the centre. It gets a
+caret and a dashed line through the lane, and the run's bracket reads *centred*.
+Now dragging either end resizes the run **around that point**: the centre holds
+still and both sides scale in proportion, so the run grows or shrinks
+symmetrically in time rather than from one end.
+
+```
+… ●────●──────◆──────●────● …      drag the right end outward
+… ●──●─────────◆─────────●──── …   the centre ◆ stays; both sides spread
+```
+
+Click the centre again — or press **Release** in the inspector — to go back to
+far-end anchoring. Changing the selection clears it.
+
 The inspector shows the run's from / span / to, takes an exact span length, and
-can **Distribute** the points inside it evenly. `Esc` collapses the selection
-back to a single point.
+can distribute the points inside it with **Even**, **Linear left**, **Linear
+right**, **Bell shape**, **Ease in**, or **Ease out** spacing. The first and last
+selected points stay fixed; the other points follow the chosen curve. Its chips
+are clickable too, so the centre can be set from the panel. `Esc` collapses the
+selection back to a single point.
 
 ### Layers — the content
 
 Text clips on three tracks. Each has its own text, effect, effect parameters,
-colour, size, alignment, tracking, offset and beat reaction, and its own in/out
-points. Any number can be live at once; track 1 renders in front.
+colour, size, alignment, tracking, 3D position and beat reaction, and its own
+in/out points. Any number can be live at once; track 1 renders in front.
+Positions are explicit scene units: `position: { x, y, z }`.
 
 A new clip takes its default effect from the phase it starts in — drop one in a
 轉 region and it arrives as Shatter, drop one in 承 and it arrives as Spread.
@@ -107,17 +172,28 @@ A new clip takes its default effect from the phase it starts in — drop one in 
 
 ## Audio
 
-Three lanes play together, each with its own file, position, level and mute:
+Three lanes play together. BGM is one analysed file; VO and SFX can each contain
+multiple independently positioned files, with their own level and mute:
 
 | Lane | Purpose | Analysed |
 |---|---|---|
 | **BGM** | the music | yes — beats, tempo, peaks |
-| **VO** | voiceover | waveform only |
+| **VO** | voiceover | waveform + optional local word timestamps |
 | **SFX** | sound effects | waveform only |
 
-Every lane is a region on the timeline: grab its waveform to slip it earlier or
-later, snapping to guides, bars, beats and peaks. Drag one left of zero to trim
-into it. Each lane also has a numeric start, a level fader and a mute.
+Every audio file is a region on the timeline: grab its waveform to slip it
+earlier or later, snapping to guides, bars, beats and peaks. Drag one left of
+zero to trim into it. Each file has a numeric start, a level fader and a mute;
+the **Add voice…** and **Add effects…** buttons append another clip to their
+lane, ready to be positioned independently.
+
+Voice clips have an **Analyse words** control. It runs a quantised
+`Xenova/whisper-tiny` speech model in a worker in the browser, returning word
+start/end times relative to that source. The first run downloads and caches the
+model; the VO samples remain local. Once analysed, word boundaries appear on
+the VO waveform and text-layer moves, trims, and new layers can snap to them
+with **Snap text to VO words**. The timings move with the VO clip when it is
+slipped.
 
 The music lane is decoded on the main thread and analysed in a worker:
 
@@ -152,6 +228,9 @@ Two controls thin them out:
 Peaks show as amber ticks along the bottom of the music lane. Snap priority is
 guides → bars → **peaks** → beats → clip edges.
 
+For text-layer edits, analysed VO word boundaries are checked after the guide
+lines and before the music grid.
+
 ## Metronome
 
 A synthesised click on its own bus — it plays *over* the music rather than
@@ -165,10 +244,25 @@ a metre to snap to — the beat lane shows it in a cooler colour to distinguish 
 from a detected grid. `m` toggles the click; the click stays out of recordings
 unless you ask for it.
 
-The transport clock rides the `AudioContext` while audio is genuinely running,
-so nothing drifts against the track, and falls back to `performance.now()` when
-the context has not been resumed — a suspended context reports a frozen
-`currentTime`, which would otherwise stall the whole composition.
+---
+
+## Backdrop video
+
+Three visual-only **V1 / V2 / V3** channels sit behind every text layer. Each
+channel can hold multiple independently positioned video clips: choose several
+files in one import, drag a region or edit its start time to slip it, and use
+the clip-level replace/remove controls to manage the lane. Channels are
+composited in order — V3 is above V2, V2 is above V1 — while later clips in one
+channel sit above earlier clips.
+
+Every clip has its own visibility, opacity, frame fitting (**Cover**,
+**Contain**, or **Stretch**), optional looping, and a simple geometry mask.
+Choose **Rectangle** or **Circle**, position and size it in frame percentages,
+and soften its edge with **Edge blur**. **In effect** and **Out effect** each
+support **Cut** or **Fade**, with an editable duration; fades cross-dissolve
+overlapping clips, while an exit fade is ignored for a looping clip. Video audio
+is muted by design; use the BGM, VO, or SFX lanes when sound should be part of
+playback and recording.
 
 ---
 
@@ -176,15 +270,15 @@ the context has not been resumed — a suspended context reports a frozen
 
 The camera is not a layer — it moves the view, so every live clip is reframed at
 once, and because the stage renders in perspective a pan gives real parallax
-against glyphs that effects have pushed into depth.
+against glyphs that effects have pushed into depth. Its position is authored in
+the same 3D scene units as the text layers.
 
-Keys sit on their own **CAM** row, drawn as diamonds on a curve of the zoom
-value so the shape of the move reads at a glance. Each key holds:
+Keys sit on their own **CAM** row, drawn as diamonds on a curve of camera depth
+so the shape of the move reads at a glance. Each key holds:
 
 | | |
 |---|---|
-| **Pan X / Y** | fractions of the frame, so a move survives a change of resolution |
-| **Zoom** | multiple of the default framing (0.2–4×) |
+| **Position X / Y / Z** | explicit scene-space coordinates shared with text layers |
 | **Roll** | degrees |
 | **Easing** | smooth, linear, ease in, ease out, or hold — governs the segment *leaving* that key |
 
@@ -195,6 +289,26 @@ adding one never makes the camera jump. Before the first key and after the last
 the camera holds that key, which means a single key works as a static reframe.
 The whole track can be switched off without discarding the keys.
 
+Enable **Split position channels (X / Y / Z)** when the axes need different
+timing. The CAM row becomes three lanes, each with its own key times, values,
+and easing, so X and Y can take several position keys without creating extra
+Z keys. Double-click an axis lane or use its `+ key` button to key only that
+axis. **Linear full span** on Z replaces its keys with a linear start-to-end
+move across the video; **Key all channels** creates a synchronized position key
+when that is what the move needs. Turning split mode off merges the channel
+values back into the legacy combined-key view, and older project files continue
+to load in combined mode.
+
+## 3D space view
+
+The viewport's **3D Space** mode shows every text layer in its authored world
+position, the active camera's frustum, and the camera key path. A small **Output
+Preview** window overlays the 3D viewport and shows the live result from the
+authored camera. It stays fixed while the scene is orbited. Drag to orbit,
+shift-drag to pan, and scroll to zoom. Click a text mesh to select it; edit its
+X/Y/Z coordinates in the Layer inspector. Output mode remains the camera view
+used for full-size preview and recording.
+
 ## Timeline
 
 | Gesture | Result |
@@ -203,7 +317,8 @@ The whole track can be switched off without discarding the keys.
 | drag any other 起承轉合 point | move that reference line on its own |
 | drag an empty guide lane | marquee-select the points in that level |
 | ⌘/Ctrl-click a point | add it to / remove it from the selection |
-| drag either end of a selected run | rescale the run by ratio, anchored on the other end |
+| click a point of a selected run | make it the centre the run scales about (click again to release) |
+| drag either end of a selected run | rescale it — about the centre if one is set, otherwise from the far end |
 | drag a point inside a selected run | slide the whole run |
 | drag the animation brackets | move / stretch the animation arc inside the video |
 | drag the end cap | stretch the whole composition (⌥ keeps positions, otherwise everything scales) |
@@ -211,27 +326,53 @@ The whole track can be switched off without discarding the keys.
 | drag a clip edge | trim |
 | double-click a track | new layer filling that phase |
 | double-click a clip | zoom to it |
+| drag a backdrop video clip | slip that clip earlier or later |
 | drag a waveform | slip that lane earlier or later (left of zero trims in) |
-| drag the ruler | scrub |
+| no audio or backdrop loaded | the unused media lanes collapse to save space |
+| drag the ruler | scrub; hold ⇧ to snap to reference lines and the beat grid |
 | wheel / ⇧wheel | zoom / pan |
-| ⇧ while dragging | ignore snapping |
+| ⇧ while dragging edits | ignore snapping; while dragging the ruler, ⇧ enables snapping |
 
 Keys: `space` play · `←/→` step a frame (`⇧` ten) · `↑/↓` select layer ·
 `[` `]` jump to in/out · `n` new layer · `k` camera key · `m` metronome ·
-`⌘D` duplicate · `⌫` delete · `f` fit · `l` loop.
+`⌘D` duplicate · `⌘C` copy · `⌘V` paste at the playhead · `⌫` delete · `f` fit · `l` loop.
+
+Copy/paste uses the system clipboard when available and keeps an in-app
+fallback. A pasted layer preserves its visual offset from the camera at copy
+time, then accumulates the camera's current frame offset, so moving the camera
+does not strand a newly created layer at world origin. New layers from **Add
+text** use the same camera-relative placement.
+
+**A focused slider owns the arrow keys.** Click any property slider and `←/→`
+nudge that value by one step instead of scrubbing the timeline; the slider draws
+a focus ring so it is clear where the keyboard is pointing. `Esc` releases it and
+hands the arrows back to the transport, and `space` still starts playback either
+way, since a range input does nothing with it. Panels that rebuild themselves —
+the camera key editor, the audio lane faders — skip the rebuild while a control
+inside them has focus, so the value under your finger is never yanked away
+mid-adjustment.
 
 ---
 
 ## Effects
 
 Each effect is a pure function of `(glyph slot, progress through the clip)` that
-writes a transform, so it owns its whole arc — entrance, life and exit.
+writes a transform, so it owns its whole arc — entrance, life and exit. Twenty
+of them, grouped by the phase they suit; the inspector offers a phase's own
+effects first and the rest below.
 
-- **起** Strike, Rise, Bloom, Typewriter, Unfold
-- **承** Spread, Breathe, Wave, Drift, Tracking
-- **轉** Shatter, Flip, Glitch, Explode, Scramble
-- **合** Converge, Collapse, Dissolve
-- **any** Zoom, Hold
+| Phase | Effects |
+|---|---|
+| **起** open | Strike · Rise · Bloom · Typewriter · Unfold |
+| **承** develop | Spread · Breathe · Wave · Drift · Tracking |
+| **轉** turn | Shatter · Flip · Glitch · Explode · Scramble · Unfold |
+| **合** close | Converge · Collapse · Dissolve |
+| any | Zoom · Hold |
+
+Every effect reads the same context — the glyph's index in the line, progress
+through the clip, elapsed time, and a beat pulse that decays from each beat and
+is scaled by the clip's *Beat reaction*. Effects never touch the DOM or the
+store, which is why adding one is a single object in `js/effects.js`.
 
 ---
 
@@ -280,8 +421,134 @@ jsDelivr) or your own `.ttf` / `.otf` / `.woff`.
 The canvas is always rendered at the project's true pixel size, so the recording
 is 1:1 with the composition.
 
-**Save** / **Open** write a `.ktc.json` project file. Audio is referenced by
-name, never embedded — reload the track after opening a project.
+**Save** / **Open** write a `.ktc.json` project file. Audio and backdrop settings
+are saved, while the source files are referenced by name rather than embedded —
+reload each source after opening a project.
+
+---
+
+## Project file
+
+`Save` writes a `.ktc.json` shaped like this. Buffers and font binaries are never
+embedded — only the names needed to re-attach them.
+
+```jsonc
+{
+  "format": "kinetic-typography-composer",
+  "version": 8,
+  "project": {
+    "name": "…", "width": 1080, "height": 1080, "fps": 30, "duration": 24,
+    "bg": "#08090c", "vignette": 0.45, "grain": 0.06, "depth": 0,
+
+    // 起承轉合 reference lines, two levels, each with its own span
+    "levels": {
+      "overall":   { "key": "overall",   "repeats": 1, "start": 0, "end": 24,
+                     "guides": [{ "id": "g_…", "role": "qi", "t": 0 }] },
+      "animation": { "key": "animation", "repeats": 3, "start": 0, "end": 24,
+                     "guides": [] }
+    },
+
+    // the layers that actually render
+    "clips": [{
+      "id": "c_…", "start": 0, "end": 8, "track": 0,
+      "text": "KINETIC", "effect": "strike", "params": { "impact": 1.5 },
+      "color": "#ffffff", "size": 0.2, "align": "center",
+      "lineHeight": 1.25, "tracking": 0,
+      "position": { "x": 0, "y": 0, "z": 0 },
+      "beatReact": 0.25
+    }],
+
+    // keyframed framing
+    "camera": {
+      "enabled": true,
+      "mode": "combined",             // or "split" for independent X/Y/Z channels
+      "keys": [{ "id": "ck_…", "t": 0,
+                 "position": { "x": 0, "y": 0, "z": 1483.0 },
+                 "roll": 0, "ease": "smooth" }]
+      // split mode also stores channels: { "x": [{ "t": 0, "value": 0, "ease": "smooth" }], ... }
+    }
+  },
+
+  "audio": {                       // null when nothing is loaded
+    "bpm": 120.1, "offset": 0, "beatsPerBar": 4, "hitGap": 0.35, "hitSense": 0.2,
+    "tracks": {
+      "bgm": { "name": "song.wav", "start": 0, "volume": 1, "mute": false, "duration": 16 },
+      "vo": { "clips": [
+        { "name": "intro.wav", "start": 0, "volume": 1, "mute": false, "duration": 2.4 },
+        { "name": "line-2.wav", "start": 3.1, "volume": 1, "mute": false, "duration": 1.8 }
+      ] },
+      "sfx": { "clips": [] }
+    }
+  },
+  "video": {                       // null when no backdrop is loaded
+    "channels": {
+      "v1": { "clips": [{
+        "id": "v_…", "name": "texture.mp4", "start": 0, "opacity": 1,
+        "fit": "cover", "loop": true, "visible": true, "duration": 12,
+        "inEffect": "fade", "inDuration": 0.5,
+        "outEffect": "fade", "outDuration": 0.5,
+        "mask": { "shape": "none", "x": 0.5, "y": 0.5,
+                  "width": 0.72, "height": 0.72, "blur": 0 }
+      }] }
+    }
+  },
+  "metro": { "on": false, "voice": "kit", "volume": 0.7, "source": "track", "bpm": 120 },
+  "fonts": [{ "name": "Inter · Bold", "preset": "inter-700" }, null, null]
+}
+```
+
+---
+
+## Development notes
+
+The decisions that were not obvious, and the bugs that came out of testing.
+
+**Guides are not containers.** The first cut modelled 起承轉合 as stages that
+owned their content. That was wrong: they are reference lines, like a grid on a
+canvas, and content is a separate layer list that merely snaps to them. Almost
+every later feature — two levels, multi-select, camera keys — only works because
+of that separation.
+
+**Editing must be non-destructive.** Adding a 承轉 pair splits the longest 承
+rather than re-laying-out the level, so hand-placed points never move; stepping
+the count up and down is lossless. `Rebalance` is the single control that
+deliberately re-flows a level.
+
+**CJK counters need containment, not winding.** Deciding holes by winding
+direction alone turns 起 into a solid blob, because CJK faces routinely draw
+overlapping strokes: one stroke's start point lands inside its neighbour and gets
+punched out. A contour is only a counter when it is *wholly* inside another
+(bounding box included) and wound the other way.
+
+**Overlapping strokes must not double-blend.** Those same overlaps show as
+bright seams while a glyph fades. Flat glyph material uses
+`depthWrite: true` with `depthFunc: LessDepth`, which rejects coplanar re-draws,
+so a glyph fades as one shape.
+
+**Kerning comes from the browser, not the font library.** opentype.js does not
+resolve GPOS lookup type 9 (Extension Positioning) in either 1.3.4 or 2.0.0 —
+and that is where Inter's letter pairs and the whole of Playfair Display's kern
+feature live, so it reports `0` for every pair. Metrics are measured with the
+platform shaper instead; where opentype *can* read the data the two agree
+exactly, which is what validates the swap.
+
+**The transport clock cannot depend on the AudioContext alone.** It rides
+`AudioContext.currentTime` while audio is genuinely running, so nothing drifts
+against the track, and falls back to `performance.now()` when the context has
+not been resumed — a suspended context reports a frozen `currentTime`, which
+would otherwise stall the whole composition. It re-bases on the switch so the
+playhead stays continuous.
+
+**The metronome fired every beat twice.** A unit test of the scheduler caught it:
+the "did the transport jump?" check mistook normal lookahead scheduling for a
+seek and kept re-seeking onto the beat it had just queued. It now compares
+against the previous transport reading and only re-seeks on a genuine jump.
+
+**Analysis latency is real and correctable.** A transient shows up in the
+spectral flux about half an analysis window *before* it actually sounds, so
+every onset and beat is pushed later by `FRAME / 2` samples to put it back where
+it belongs. That correction moved the detected downbeat from 0.229 s to 0.253 s
+against a true 0.25 s.
 
 ---
 
@@ -289,6 +556,7 @@ name, never embedded — reload the track after opening a project.
 
 ```
 index.html                 shell + panels
+serve.py                   dev server: no-cache headers, correct MIME types
 css/app.css                chrome Tailwind does not cover
 js/main.js                 bootstrap, transport, frame loop
 js/state.js                project store + event bus
@@ -299,8 +567,10 @@ js/typography.js           opentype.js → three.js geometry
 js/renderer.js             three.js stage, compositing
 js/timeline.js             canvas timeline, all editing gestures
 js/ui.js                   panel wiring
+js/util.js                 maths, easing, formatting, DOM helpers
 js/export.js               WebM capture
 js/audio/engine.js         three-lane playback, transport clock, worker hand-off
 js/audio/metronome.js      synthesised click bus + manual tempo grid
 js/audio/analyzer.worker.js  FFT, onsets, tempo, beat grid
+js/video/engine.js         muted backdrop video elements and transport sync
 ```

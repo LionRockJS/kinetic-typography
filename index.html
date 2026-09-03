@@ -133,11 +133,27 @@ tailwind.config = {
           <div class="grid grid-cols-2 gap-1.5">
             <button id="btnAddClip" class="btn">Add text</button>
             <button id="btnDupClip" class="btn">Duplicate</button>
+            <button id="btnCopyClip" class="btn" title="Copy the selected layer (⌘/Ctrl+C)">Copy</button>
+            <button id="btnPasteClip" class="btn" title="Paste a copied layer at the playhead (⌘/Ctrl+V)">Paste</button>
           </div>
           <div id="clipList" class="space-y-1"></div>
           <p class="text-[10px] leading-relaxed text-zinc-600">
             Double-click an empty spot on a track to drop a layer there; drag its edges to trim,
-            drag it up or down to change track.
+            drag it up or down to change track. Copy/paste keeps the layer's camera-relative
+            position and pastes it at the current playhead.
+          </p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Backdrop video</span><span id="videoChip" class="chip">none</span></div>
+        <div class="panel-bd">
+          <div id="videoChannels" class="space-y-1.5"></div>
+          <input id="videoFile" type="file" accept="video/*" multiple class="hidden">
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            Three visual channels sit behind every text layer. Add several videos to
+            one lane, then set each clip's timing, In / Out fade, opacity, loop, fit,
+            and mask. Video audio is muted; use the Audio lanes for sound.
           </p>
         </div>
       </section>
@@ -146,13 +162,26 @@ tailwind.config = {
         <div class="panel-hd"><span>Audio</span><span id="audioChip" class="chip">no audio</span></div>
         <div class="panel-bd">
           <div id="audioLanes" class="space-y-1.5"></div>
-          <input id="audioFile" type="file" accept="audio/*" class="hidden">
+          <p class="text-[10px] leading-relaxed text-zinc-600">
+            BGM is one analysed source. Add as many voiceover or effects clips as you need;
+            each can be positioned and mixed independently on its lane.
+          </p>
+          <input id="audioFile" type="file" accept="audio/*" multiple class="hidden">
 
           <div id="audioProgress" class="hidden">
             <div class="h-1 rounded-full bg-base-600 overflow-hidden">
               <div id="audioBar" class="h-full w-0 bg-sky-500 transition-[width] duration-150"></div>
             </div>
             <div id="audioStatus" class="text-[10px] text-zinc-500 mt-1">Analysing…</div>
+          </div>
+
+          <div class="rounded-md border border-line bg-base-900 p-2 space-y-1.5">
+            <label class="tog"><input id="tSnapWords" type="checkbox" class="accent-emerald-500" checked>
+              <span class="text-emerald-300">Snap text to VO words</span></label>
+            <p class="text-[10px] leading-snug text-zinc-600">
+              Import a voiceover, then press <span class="text-zinc-400">Analyse words</span> on its lane.
+              Word boundaries stay attached when the VO is slipped.
+            </p>
           </div>
 
           <div id="audioInfo" class="hidden space-y-2.5 pt-1 border-t border-line/70">
@@ -287,9 +316,16 @@ tailwind.config = {
           <span id="vpStage" class="chip !bg-black/50 backdrop-blur"></span>
         </div>
         <div class="absolute top-3 right-3 flex items-center gap-1.5">
-          <label class="tog !text-[10px] px-2 py-1 rounded bg-black/50 backdrop-blur">
+          <div id="viewModeSwitch" class="flex items-center gap-0.5 rounded-md bg-black/50 p-0.5 backdrop-blur border border-white/10">
+            <button id="viewOutput" class="btn !border-transparent !px-2 !py-1 !text-[10px]" type="button" title="Show the final camera output">Output</button>
+            <button id="viewSpace" class="btn !border-transparent !px-2 !py-1 !text-[10px]" type="button" title="Inspect cameras and text layers in 3D space">3D Space</button>
+          </div>
+          <label id="safeToggle" class="tog !text-[10px] px-2 py-1 rounded bg-black/50 backdrop-blur">
             <input id="tSafe" type="checkbox" class="accent-sky-500"> Safe area
           </label>
+        </div>
+        <div id="spaceHint" class="hidden absolute bottom-3 left-1/2 -translate-x-1/2 px-2 py-1 rounded bg-black/60 border border-white/10 text-[10px] text-zinc-400 backdrop-blur pointer-events-none">
+          drag to orbit · shift-drag to pan · scroll to zoom · click a text layer to select
         </div>
       </div>
     </main>
@@ -308,6 +344,7 @@ tailwind.config = {
         </div>
         <div class="panel-bd">
           <label class="tog"><input id="camEnabled" type="checkbox" class="accent-violet-500" checked> Camera track active</label>
+          <label class="tog"><input id="camSplit" type="checkbox" class="accent-violet-500"> Split position channels (X / Y / Z)</label>
           <div class="grid grid-cols-2 gap-1.5">
             <button id="btnCamKey" class="btn">Key at playhead</button>
             <button id="btnCamClear" class="btn">Clear track</button>
@@ -315,8 +352,20 @@ tailwind.config = {
           <div id="camKeyPanel" class="space-y-2.5"></div>
           <p class="text-[10px] leading-relaxed text-zinc-600">
             The camera moves the view, so every live layer is affected at once — and since the stage is
-            rendered in perspective, panning gives real parallax against glyphs pushed into depth.
+            rendered in perspective, its 3D position gives real parallax against glyphs pushed into depth.
           </p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-hd"><span>Particles</span><span id="particleChip" class="chip">off</span></div>
+        <div class="panel-bd">
+          <div class="grid grid-cols-2 gap-1.5">
+            <button id="btnAddEmitter" class="btn">Add emitter</button>
+            <button id="btnDupEmitter" class="btn">Duplicate</button>
+          </div>
+          <div id="emitterList" class="space-y-1"></div>
+          <div id="particlePanel" class="space-y-2.5"></div>
         </div>
       </section>
 
@@ -368,7 +417,7 @@ tailwind.config = {
       <div class="flex-1"></div>
 
       <div class="flex items-center gap-1.5 text-[10px] text-zinc-500">
-        <span class="hidden xl:inline text-zinc-600">drag point = move · drag end cap = stretch · ⌥ keeps positions · ⇧ ignores snap</span>
+        <span class="hidden xl:inline text-zinc-600">drag point = move · drag end cap = stretch · ⇧ playhead snaps · ⇧ edits ignore snap</span>
         <button id="btnZoomOut" class="btn btn-sq">−</button>
         <button id="btnZoomFit" class="btn !px-2">Fit</button>
         <button id="btnZoomIn" class="btn btn-sq">+</button>
@@ -381,7 +430,7 @@ tailwind.config = {
   </footer>
 </div>
 
-<input id="projFile" type="file" accept="application/json,.json" class="hidden">
+<input id="projFile" type="file" accept=".ktc.json,.json,application/json" class="hidden">
 
 <div id="toast" class="fixed bottom-[210px] left-1/2 -translate-x-1/2 z-50 hidden px-3 py-2 rounded-md bg-base-600 border border-line text-xs text-zinc-200 shadow-xl"></div>
 

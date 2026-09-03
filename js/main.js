@@ -1,10 +1,16 @@
 // Bootstrap: wires the store, the three.js stage, the timeline and the panels together.
 
-import { state, clips, track, initProject, on, emit, setTime, setDuration,
-         syncBeatTimes, beatTimes, setMetro, setFont, fontStack, fontsReady } from './state.js';
+import { state, clips, track, audioClips, audioClip, addAudioClip, removeAudioClip,
+         initProject, on, emit, setTime, setDuration,
+         syncBeatTimes, beatTimes, setMetro, setFont, fontStack, fontsReady, select,
+         selectCameraKey,
+         videoChannels, videoChannel, videoClips, videoClip, addVideoClip,
+         removeVideoClip, makeVideoChannel } from './state.js';
 import { StageRenderer } from './renderer.js';
 import { Timeline } from './timeline.js';
 import { AudioEngine, analyze, waveformPeaks, TRACK_KINDS } from './audio/engine.js';
+import { analyzeSpeech } from './audio/speech.js';
+import { VideoEngine, VIDEO_CHANNEL_KINDS } from './video/engine.js';
 import { Metronome } from './audio/metronome.js';
 import { Recorder } from './export.js';
 import { FONT_PRESETS, loadFontFromUrl, loadFontFromFile } from './typography.js';
@@ -14,13 +20,22 @@ import { $, clamp, toast, download, fmtDur } from './util.js';
 const canvas = $('#stageCanvas');
 const renderer = new StageRenderer(canvas);
 const engine = new AudioEngine();
+const videoEngine = new VideoEngine();
 const timeline = new Timeline($('#timelineCanvas'), $('#tlTip'));
 const recorder = new Recorder(canvas, engine);
 const metro = new Metronome(engine);
 
+renderer.onPick = id => select('clip', id);
+renderer.onPickCamera = (id, axis = null) => axis
+  ? selectCameraKey(axis, id)
+  : select('camkey', id);
+renderer.onViewChange = () => { dirty = true; };
+
 let dirty = true;
 let stopAt = null;          // temporary out-point for "preview stage"
 let firstAudio = true;
+const speechRuns = new Map();
+const speechTokens = new Map();
 
 // ══ transport ════════════════════════════════════════════════
 function togglePlay() { state.ui.playing ? pause() : play(); }
@@ -29,12 +44,14 @@ function play() {
   if (state.ui.time >= state.project.duration - 1e-3) seek(0);
   engine.play(state.ui.time);
   state.ui.playing = true;
+  videoEngine.play(videoChannels(), state.ui.time);
   metro.start();
   syncPlayButton(true);
 }
 
 function pause() {
   engine.pause();
+  videoEngine.pause(videoChannels(), state.ui.time);
   metro.stop();
   state.ui.playing = false;
   stopAt = null;
@@ -45,6 +62,7 @@ function seek(t) {
   const v = clamp(t, 0, state.project.duration);
   engine.seek(v);
   setTime(v);
+  videoEngine.seek(videoChannels(), v, state.ui.playing);
   metro._reseek();
   dirty = true;
 }
@@ -56,18 +74,44 @@ function playRange(a, b) {
 }
 
 // ══ audio ════════════════════════════════════════════════════
-/** Import a file into one of the three lanes. Only the music lane is analysed. */
+function audioInsertStart(kind, duration) {
+  const end = audioClips(kind).filter(clip => clip.ready).reduce((latest, clip) =>
+    Math.max(latest, clip.start + clip.duration), 0);
+  return clamp(Math.max(state.ui.time, end), -duration, state.project.duration);
+}
+
+/** Import a file into one of the three lanes. Music gets beat analysis; VO can
+ * be sent through the separate word-timing pass from its lane controls. */
 async function importAudio(file, kind = 'bgm') {
-  const tr = track(kind);
+  const tr = kind === 'bgm' ? track('bgm') : null;
+  let clip = null;
+  let createdClip = false;
   try {
     setAudioProgress(0.02, `decoding ${kind.toUpperCase()}…`);
     const { buffer, mono, sampleRate } = await engine.decode(file);
-    engine.setBuffer(kind, buffer);
 
-    Object.assign(tr, {
+    const props = {
       name: file.name, duration: buffer.duration, ready: true,
       peaks: waveformPeaks(mono, 2048)
-    });
+    };
+
+    if (kind === 'bgm') {
+      engine.setBuffer(kind, buffer);
+      Object.assign(tr, props);
+    } else {
+      // Opening a project restores reference-only VO/SFX clips as pending.
+      // Re-importing the same filename should attach to that saved clip so
+      // its timing and mix settings survive, rather than creating a duplicate.
+      clip = audioClips(kind).find(saved => !saved.ready && saved.name === file.name) ?? null;
+      if (!clip) {
+        clip = addAudioClip(kind, { ...props, start: audioInsertStart(kind, buffer.duration) }, { notify: false });
+        createdClip = true;
+      } else {
+        Object.assign(clip, props);
+      }
+      if (!clip) throw new Error(`Unknown audio lane: ${kind}`);
+      engine.setBuffer(kind, buffer, clip.id);
+    }
 
     if (kind === 'bgm') {
       const result = await analyze(mono, sampleRate, (v, label) => setAudioProgress(0.05 + v * 0.93, label));
@@ -84,7 +128,7 @@ async function importAudio(file, kind = 'bgm') {
       syncBeatTimes();
       toast(`${result.bpm.toFixed(1)} BPM · ${result.beats.length} beats · ${state.audio.hits.length} peaks`);
     } else {
-      toast(`${kind.toUpperCase()}: ${file.name} · ${fmtDur(buffer.duration)}`);
+      toast(`${kind.toUpperCase()}: ${file.name} · ${fmtDur(buffer.duration)} · added to lane`);
     }
 
     setAudioProgress(1.1, '');
@@ -99,27 +143,168 @@ async function importAudio(file, kind = 'bgm') {
     dirty = true;
   } catch (err) {
     console.error(err);
+    if (clip && createdClip) {
+      engine.clearTrack(kind, clip.id);
+      removeAudioClip(kind, clip.id);
+    }
     setAudioProgress(-1, '');
     toast(`Could not read that ${kind.toUpperCase()} file`);
   }
 }
 
-function clearAudio(kind = 'bgm') {
+/** Run local Whisper on one loaded VO clip and keep its timings relative to the source. */
+async function analyzeVoice(kind = 'vo', id) {
+  if (kind !== 'vo') return;
+  const clip = audioClip(kind, id);
+  if (!clip?.ready) { toast('Import a voiceover first'); return; }
+  if (speechRuns.has(id)) return;
+
+  const source = engine.getSourceData(kind, id);
+  if (!source) { toast('That voiceover is not decoded'); return; }
+
+  const token = (speechTokens.get(id) ?? 0) + 1;
+  speechTokens.set(id, token);
+  speechRuns.set(id, token);
+  clip.speechStatus = 'analyzing';
+  clip.speechError = '';
+  emit('audio', state.audio);
+  timeline.draw();
+
+  try {
+    const result = await analyzeSpeech(source.mono, source.sampleRate, (value, label) => {
+      setAudioProgress(value, `VO · ${label}`);
+    });
+    const live = audioClip(kind, id);
+    if (!live || speechRuns.get(id) !== token) return;
+    live.transcript = result.text || '';
+    live.words = Array.isArray(result.words) ? result.words : [];
+    live.speechStatus = live.words.length ? 'ready' : 'error';
+    live.speechError = live.words.length ? '' : 'No word timestamps were returned';
+    emit('audio', state.audio);
+    timeline.draw();
+    dirty = true;
+    toast(live.words.length
+      ? `${live.words.length} VO words detected — text snapping is ready`
+      : 'VO was recognised, but no word timings were returned');
+  } catch (err) {
+    console.error(err);
+    const live = audioClip(kind, id);
+    if (live && speechRuns.get(id) === token) {
+      live.speechStatus = 'error';
+      live.speechError = String(err?.message || err);
+      emit('audio', state.audio);
+    }
+    toast('Could not analyse that voiceover');
+  } finally {
+    if (speechRuns.get(id) === token) {
+      speechRuns.delete(id);
+      setAudioProgress(-1, '');
+    }
+  }
+}
+
+function clearAudio(kind = 'bgm', id = null) {
   if (state.ui.playing) pause();
-  engine.clearTrack(kind);
-  Object.assign(track(kind), {
-    name: '', duration: 0, peaks: null, start: 0, ready: false
-  });
   if (kind === 'bgm') {
+    engine.clearTrack(kind);
+    Object.assign(track(kind), {
+      name: '', duration: 0, peaks: null, start: 0, ready: false
+    });
     Object.assign(state.audio, {
       beats: [], onsets: [], onsetStrength: [], envelope: null, bpm: 0, offset: 0, hits: []
     });
     setMetro({ source: 'manual' });
     syncBeatTimes();
+  } else if (id) {
+    speechTokens.set(id, (speechTokens.get(id) ?? 0) + 1);
+    speechRuns.delete(id);
+    engine.clearTrack(kind, id);
+    removeAudioClip(kind, id);
+  } else {
+    engine.clearTrack(kind);
+    for (const clip of [...audioClips(kind)]) {
+      speechTokens.set(clip.id, (speechTokens.get(clip.id) ?? 0) + 1);
+      speechRuns.delete(clip.id);
+      removeAudioClip(kind, clip.id);
+    }
   }
+  // Removing a VO while its worker is finishing invalidates the result above;
+  // do not leave the shared progress bar hanging once no analysis is live.
+  if (!speechRuns.size) setAudioProgress(-1, '');
   emit('audio', state.audio);
   timeline.draw();
   dirty = true;
+}
+
+// ══ backdrop video ═════════════════════════════════════════
+/** Import a muted visual source into one of the independent backdrop lanes. */
+function videoInsertStart(kind, duration) {
+  const end = videoClips(kind).filter(clip => clip.ready).reduce((latest, clip) =>
+    Math.max(latest, clip.start + clip.duration), 0);
+  return clamp(Math.max(state.ui.time, end), -duration, state.project.duration);
+}
+
+async function importVideo(file, kind = 'v1', replaceId = null) {
+  let clip = replaceId ? videoClip(kind, replaceId) : null;
+  let createdClip = false;
+  try {
+    if (!clip) {
+      // Opening a project restores reference-only backdrop clips as pending.
+      // Re-importing the same filename re-attaches that saved clip so its
+      // timing and transition settings survive instead of creating a duplicate.
+      clip = videoClips(kind).find(saved => !saved.ready && saved.name === file.name) ?? null;
+      if (!clip) {
+        clip = addVideoClip(kind, { start: videoInsertStart(kind, 0) }, { notify: false });
+        createdClip = true;
+      }
+    }
+    if (!clip) throw new Error(`Unknown backdrop lane: ${kind}`);
+
+    const { duration } = await videoEngine.load(kind, clip.id, file);
+    Object.assign(clip, {
+      name: file.name,
+      duration,
+      start: clamp(clip.start, -duration, state.project.duration),
+      inDuration: clamp(Number(clip.inDuration) || 0, 0, duration),
+      outDuration: clamp(Number(clip.outDuration) || 0, 0, duration),
+      ready: true
+    });
+    videoEngine.sync(videoChannels(), state.ui.time, state.ui.playing, { force: true });
+    emit('video', state.video);
+    timeline.draw();
+    dirty = true;
+    const short = VIDEO_CHANNEL_KINDS.find(v => v.kind === kind)?.short ?? kind;
+    toast(`${short}: ${file.name} · ${fmtDur(duration)} · added to lane`);
+  } catch (err) {
+    console.error(err);
+    if (clip && createdClip) {
+      videoEngine.clear(kind, clip.id);
+      removeVideoClip(kind, clip.id);
+    }
+    toast('Could not read that video file');
+  }
+}
+
+function clearVideo(kind = 'v1', id = null) {
+  const lane = videoChannel(kind);
+  if (!lane) return;
+  if (id) {
+    videoEngine.clear(kind, id);
+    removeVideoClip(kind, id);
+  } else {
+    videoEngine.clear(kind);
+    lane.clips.splice(0, lane.clips.length);
+  }
+  emit('video', state.video);
+  timeline.draw();
+  dirty = true;
+}
+
+function clearVideos() {
+  videoEngine.clearAll();
+  state.video.channels = Object.fromEntries(VIDEO_CHANNEL_KINDS.map(({ kind }) =>
+    [kind, makeVideoChannel(kind)]));
+  emit('video', state.video);
 }
 
 // ══ metronome ════════════════════════════════════════════════
@@ -233,13 +418,20 @@ function frame() {
     dirty = true;
   }
 
+  // Let the browser play video normally, correcting only material decoder
+  // drift so a backdrop stays aligned without seeking every animation frame.
+  videoEngine.sync(videoChannels(), state.ui.time, state.ui.playing);
+
   if (dirty || state.ui.playing) {
     renderer.render({
       time: state.ui.time,
       project: state.project,
       clips: clips(),
       fonts: fontStack(),
-      beats: beatTimes().length ? beatTimes() : null
+      videos: { channels: videoChannels(), runtime: videoEngine.channels },
+      beats: beatTimes().length ? beatTimes() : null,
+      mode: state.ui.recording ? 'output' : state.ui.viewMode,
+      selection: state.ui.sel
     });
     dirty = false;
   }
@@ -252,22 +444,48 @@ async function boot() {
   initUI({
     engine, timeline, renderer,
     togglePlay, play, pause, seek, playRange,
-    importAudio, clearAudio, loadFontUrl, loadFontFile, clearFont, toggleRecord,
+    importAudio, analyzeVoice, clearAudio, loadFontUrl, loadFontFile, clearFont, toggleRecord,
+    importVideo, clearVideo, clearVideos,
     syncMetro, setMetroEnabled
   });
 
-  on('render time fonts audio guides clips clip audioMove', () => { dirty = true; });
+  on('render time fonts audio guides clips clip audioMove video videoMove videoLevel view', () => { dirty = true; });
   on('seek', t => seek(t));
 
-  // the track can be slipped along the timeline; keep playback aligned with it
-  // keep the engine's lanes aligned with the timeline
+  // Keep every decoded source aligned with the state. VO and SFX may have
+  // several clips, so the runtime source is addressed by its clip id.
+  const syncAudioEngine = () => {
+    const bgm = track('bgm');
+    if (bgm.ready) {
+      engine.setStart('bgm', bgm.start);
+      engine.setLevel('bgm', { volume: bgm.volume, mute: bgm.mute });
+    }
+    for (const { kind } of TRACK_KINDS) {
+      if (kind === 'bgm') continue;
+      for (const clip of audioClips(kind)) {
+        if (!clip.ready) continue;
+        engine.setStart(kind, clip.start, clip.id);
+        engine.setLevel(kind, { volume: clip.volume, mute: clip.mute }, clip.id);
+      }
+    }
+  };
   on('audio audioMove', () => {
-    for (const { kind } of TRACK_KINDS) engine.setStart(kind, track(kind).start);
+    syncAudioEngine();
     if (state.ui.playing) engine.play(state.ui.time);
+    timeline.draw();
   });
-  on('audioLevel', ({ kind }) => {
-    const tr = track(kind);
-    engine.setLevel(kind, { volume: tr.volume, mute: tr.mute });
+  on('audioLevel', ({ kind, id }) => {
+    if (kind === 'bgm') {
+      const bgm = track('bgm');
+      engine.setLevel(kind, { volume: bgm.volume, mute: bgm.mute });
+    } else {
+      const clip = audioClips(kind).find(c => c.id === id);
+      if (clip) engine.setLevel(kind, { volume: clip.volume, mute: clip.mute }, clip.id);
+    }
+  });
+  on('video videoMove videoLevel', () => {
+    videoEngine.sync(videoChannels(), state.ui.time, state.ui.playing, { force: true });
+    timeline.draw();
   });
   on('grid metro', syncMetro);
   on('project duration guides clips clip', () => { dirty = true; timeline.draw(); });

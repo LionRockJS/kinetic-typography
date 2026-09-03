@@ -243,6 +243,57 @@ export function pruneGeometryCache(max = 600) {
   if (geoCache.size <= max) return;
   const keys = [...geoCache.keys()].slice(0, geoCache.size - max);
   for (const k of keys) { geoCache.get(k)?.geometry?.dispose(); geoCache.delete(k); }
+  if (outlineCache.size > max) {
+    const stale = [...outlineCache.keys()].slice(0, outlineCache.size - max);
+    for (const k of stale) outlineCache.delete(k);
+  }
+}
+
+// ── outline sampling ─────────────────────────────────────────
+const outlineCache = new Map();
+
+/**
+ * Points spaced evenly along a glyph's contours, in the same re-centred local
+ * space as `glyphGeometry` — pass that entry's `center` so the samples land on
+ * the mesh. This is what lets particles read the real letterform (counters and
+ * every CJK stroke included) rather than its bounding box.
+ *
+ * @returns {Float32Array} flat x,y pairs
+ */
+export function glyphOutline(font, glyph, size, center = { x: 0, y: 0 }, spacing = 0.075, max = 120) {
+  const key = `${font.__id}|${glyph.index}|${size.toFixed(2)}|${spacing}|${max}|` +
+              `${center.x.toFixed(1)},${center.y.toFixed(1)}`;
+  const hit = outlineCache.get(key);
+  if (hit) return hit;
+
+  const step = Math.max(1, size * spacing);
+  const pts = [];
+  for (const contour of pathToContours(glyph.getPath(0, 0, size))) {
+    const poly = contour.getPoints(6);
+    if (poly.length < 2) continue;
+    let carry = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) continue;
+      let d = carry;
+      for (; d < len; d += step) pts.push(a.x + dx * d / len, a.y + dy * d / len);
+      carry = d - len;
+    }
+  }
+
+  // Dense faces (and big sizes) would swamp the collider grid — thin them out
+  // evenly rather than dropping the tail of the outline.
+  const total = pts.length / 2;
+  const stride = total > max ? Math.ceil(total / max) : 1;
+  const out = new Float32Array(Math.ceil(total / stride) * 2);
+  for (let i = 0, j = 0; i < total; i += stride, j++) {
+    out[j * 2] = pts[i * 2] - center.x;
+    out[j * 2 + 1] = pts[i * 2 + 1] - center.y;
+  }
+  outlineCache.set(key, out);
+  return out;
 }
 
 // ── text layout ──────────────────────────────────────────────
