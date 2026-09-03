@@ -18,8 +18,9 @@ the optional speech runtime/model only when VO analysis is requested.
 | Area | State |
 |---|---|
 | 起承轉合 reference lines | two levels (overall + animation), merged 起承 handle, ratio scaling, multi-select runs, non-destructive pair insertion |
-| Text layers | 3 tracks, unlimited simultaneous clips, 20 effects, per-clip 3D position and beat reaction |
+| Text layers | 3 tracks, unlimited simultaneous clips, 20 effects, per-clip typeface / weight, 3D position, parent/child offsets, beat reaction, and colour keyframes |
 | Camera | keyframed 3D position / roll with easing, on its own track |
+| Backdrop colour | solid, linear / circular / 4-point gradients with colour keyframes |
 | Audio | 3 lanes (BGM · VO · SFX), each slippable, with level, mute, and optional VO word timing |
 | Backdrop video | 3 visual channels, each holding multiple clips with independent timing, opacity / fit / loop / mask / In-Out fades |
 | Beat analysis | STFT → spectral flux → adaptive peaks → autocorrelation tempo → phase-locked grid |
@@ -40,7 +41,7 @@ downbeat phase correct to within a frame. On a 120 BPM import the app read
 - Audio and backdrop settings are retained in a saved project, but their source
   files are referenced by name rather than embedded, so sources must be
   re-imported after opening a file.
-- The timeline collapses unused audio and backdrop lanes: it is about 258 px
+- The timeline collapses unused audio and backdrop video lanes: it is about 258 px
   with neither loaded and grows to ~428 px when every media lane is visible;
   on a short screen the stage viewport gets tight.
 - BGM is one analysed source; VO and SFX lanes can contain multiple independent clips.
@@ -66,10 +67,11 @@ no-cache headers and the right MIME types for local development.
 
 ## The model
 
-Five independent things live in a composition: the **reference lines** that give
+Six independent things live in a composition: the **reference lines** that give
 it shape, the **layers** that render, the **camera** that frames them, the
-**backdrop video** behind them, and the **audio** they are cut against. None of
-them owns any of the others.
+**backdrop colour** and **backdrop video** behind them, and the **audio** they
+are cut against. Reference lines, camera, backdrops, and audio remain
+independent; text layers may optionally parent other text layers.
 
 ### 起承轉合 — reference lines, at two levels
 
@@ -163,7 +165,21 @@ selection back to a single point.
 Text clips on three tracks. Each has its own text, effect, effect parameters,
 colour, size, alignment, tracking, 3D position and beat reaction, and its own
 in/out points. Any number can be live at once; track 1 renders in front.
-Positions are explicit scene units: `position: { x, y, z }`.
+Positions are explicit scene units: `position: { x, y, z }`. A layer can choose
+another text layer as its parent; its position then becomes a local offset, so
+moving the parent carries the child and any deeper descendants with it. Changing
+or removing a parent preserves the child's current world position.
+
+Each text block can also carry colour keyframes. Double-click inside a block, or
+press **+ Keyframe** in the selected layer's inspector, to add one at that
+moment. Select a key to edit its colour and easing; key times are local to the
+block, so moving the block carries the colour animation with it.
+
+The layer's **Typeface** control can override the stage stack with any bundled
+family and its available real weight, or with a font file loaded for that layer
+only. The stage stack remains the fallback for characters the layer face does
+not contain; **⟲** or **All from stage** restores inheritance. Built-in layer
+faces are loaded on demand.
 
 A new clip takes its default effect from the phase it starts in — drop one in a
 轉 region and it arrives as Shatter, drop one in 承 and it arrives as Spread.
@@ -246,6 +262,17 @@ unless you ask for it.
 
 ---
 
+## Backdrop colour
+
+The **BG** track is always available as the final row of the timeline. It can render a
+**Solid**, **Linear gradient**, **Circular gradient**, or **4-point gradient**.
+Double-click the BG row, or press **+ Keyframe** in the Look panel, to capture
+the current look at the playhead. Select a key to edit its colours, angle,
+gradient centre, radius, or easing; values interpolate into the next key. With
+no key selected, the controls edit the unkeyed base look. The colour plane is
+composited behind backdrop video, text, particles, and the vignette/grain
+overlay.
+
 ## Backdrop video
 
 Three visual-only **V1 / V2 / V3** channels sit behind every text layer. Each
@@ -325,10 +352,11 @@ used for full-size preview and recording.
 | drag a clip | move it; up/down changes track |
 | drag a clip edge | trim |
 | double-click a track | new layer filling that phase |
-| double-click a clip | zoom to it |
+| double-click inside a clip | add a colour key at that time |
+| drag a colour key | retime the colour change inside its clip |
 | drag a backdrop video clip | slip that clip earlier or later |
 | drag a waveform | slip that lane earlier or later (left of zero trims in) |
-| no audio or backdrop loaded | the unused media lanes collapse to save space |
+| no audio or backdrop video loaded | the unused media lanes collapse to save space |
 | drag the ruler | scrub; hold ⇧ to snap to reference lines and the beat grid |
 | wheel / ⇧wheel | zoom / pan |
 | ⇧ while dragging edits | ignore snapping; while dragging the ruler, ⇧ enables snapping |
@@ -412,7 +440,8 @@ come from the primary font; kerning only applies within a single font.
 
 The default stack is Inter Bold with Noto Sans TC Bold behind it. Any slot takes
 a bundled face (Noto Sans TC, Inter, Bebas Neue, Playfair Display, loaded from
-jsDelivr) or your own `.ttf` / `.otf` / `.woff`.
+jsDelivr) or your own `.ttf` / `.otf` / `.woff`. A layer can independently lead
+with any bundled family / weight without changing those three stage slots.
 
 ---
 
@@ -486,10 +515,16 @@ embedded — only the names needed to re-attach them.
 ```jsonc
 {
   "format": "kinetic-typography-composer",
-  "version": 8,
+  "version": 13,
   "project": {
     "name": "…", "width": 1080, "height": 1080, "fps": 30, "duration": 24,
     "bg": "#08090c", "vignette": 0.45, "grain": 0.06, "depth": 0,
+    "backdrop": {
+      "mode": "linear", "colors": ["#08090c", "#1b2333", "#26344a", "#101722"],
+      "angle": 0, "center": { "x": 0.5, "y": 0.5 }, "radius": 0.75,
+      "keys": [{ "id": "bk_…", "t": 0, "ease": "smooth",
+                 "colors": ["#08090c", "#1b2333", "#26344a", "#101722"] }]
+    },
 
     // 起承轉合 reference lines, two levels, each with its own span
     "levels": {
@@ -505,6 +540,9 @@ embedded — only the names needed to re-attach them.
       "text": "KINETIC", "effect": "strike", "params": { "impact": 1.5 },
       "color": "#ffffff", "size": 0.2, "align": "center",
       "lineHeight": 1.25, "tracking": 0,
+      "fontFamily": "Inter", "fontWeight": 400,
+      "colorKeys": [{ "id": "cck_…", "t": 2.5, "color": "#f472b6", "ease": "smooth" }],
+      "parentId": null,
       "position": { "x": 0, "y": 0, "z": 0 },
       "beatReact": 0.25
     }],
@@ -610,7 +648,7 @@ index.html                 shell + panels
 serve.py                   dev server: no-cache headers, correct MIME types
 css/app.css                chrome Tailwind does not cover
 js/main.js                 bootstrap, transport, frame loop
-js/state.js                project store + event bus
+js/state.js                project store, backdrop colour track + event bus
 js/history.js              undo / redo — project snapshots, one per gesture
 js/autosave.js             crash recovery — the project kept in localStorage
 js/structure.js            起承轉合 levels, guides, pattern, weighting

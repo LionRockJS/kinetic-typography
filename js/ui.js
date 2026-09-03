@@ -14,9 +14,13 @@ import { state, level, guides, clips, selectedClip, selectedClips, selectedClipI
          BACKDROP_MODES, backdrop, backdropAt, backdropKeys, selectedBackdropKey,
          selectBackdropKey, selectBackdropTrack, addBackdropKey, updateBackdropKey,
          setBackdrop, removeBackdropKey, clearBackdropTrack, backdropCss,
+         clipColorKeys, selectedClipColorKey, addClipColorKey, updateClipColorKey,
+         removeClipColorKey,
          setClipStage, setStageDuration,
+         setClipParent, canSetClipParent, clipWorldPosition,
          particleEmitters, selectedEmitter, selectEmitter, activeEmitterId, updateEmitter,
          addParticleEmitter, duplicateParticleEmitter, removeParticleEmitter,
+         copyEmitterData, pasteEmitter, EMITTER_CLIPBOARD_FORMAT,
          alignEmitterWithCamera,
          camera, cameraKeys, cameraMode, cameraChannelKeys, cameraKeyCount,
          selectedCamKey, selectedCamAxis,
@@ -28,13 +32,15 @@ import { state, level, guides, clips, selectedClip, selectedClips, selectedClipI
          copyClipData, pasteClip, CLIPBOARD_FORMAT,
          newProject, PROJECT_FORMAT, PROJECT_VERSION,
          FONT_SLOTS, DIM_PRESETS,
+         fontAssets, setClipFont,
          TRACKS, MIN_CLIP } from './state.js';
 import { undo, redo, resetHistory, touch, historyInfo } from './history.js';
 import { VOICES } from './audio/metronome.js';
 import { EASES, cameraAt, defaultCameraPosition } from './camera.js';
 import { TRACK_KINDS } from './audio/engine.js';
 import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
-import { PARTICLE_SHAPES, PARTICLE_ORIGINS, TEXT_MODES, MAX_EMITTERS } from './particles.js';
+import { PARTICLE_SHAPES, PARTICLE_ORIGINS, TEXT_MODES, MAX_EMITTERS,
+         PARTICLE_CURVE_POINTS, PARTICLE_CURVE_PRESETS, normalizeParticleCurve } from './particles.js';
 import { ROLES, LEVELS, LEVEL_KEYS, patternLabel, rebalanceGuides, guideDisplay, guideHandles,
          regionAt, drivingRegion, normalizeGuides, scaleRange, distributeRange, DISTRIBUTIONS } from './structure.js';
 import { EFFECTS, effectsForRole, effectIds, resolveParams,
@@ -48,6 +54,8 @@ import { pickAudioFiles, pickVideoFiles } from './media/pick.js';
 
 let app;
 let clipClipboard = null;
+let emitterClipboard = null;
+let activeCurveGesture = null;
 
 function parseProjectFile(text) {
   // JSON exported by some desktop/browser combinations can start with a UTF-8
@@ -84,7 +92,7 @@ export function initUI(ctx) {
   on('history', syncHistoryButtons);
   on('guides duration', () => { renderPattern(); syncInspector(); });
   on('clips duration', () => { renderClipList(); syncInspector(); });
-  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); renderParticlePanel(); renderBackdropPanel(); });
+  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); renderParticlePanel(true); renderBackdropPanel(); });
   on('camera', renderCameraPanel);
   on('clip', () => { renderClipList(); syncInspector(); });
   on('audio audioMove audioLevel hits', syncAudioPanel);
@@ -93,11 +101,12 @@ export function initUI(ctx) {
   on('particles project duration', renderParticlePanel);
   on('particleMove', renderEmitterList);   // a timeline drag only moves the window
   on('metro grid audio', syncMetroPanel);
-  on('fonts', () => { syncFontPanel(); renderStageText(); });
+  on('fonts', () => { syncFontPanel(); renderStageText(); syncInspector(); });
   // The stage style also decides what an inherited field in the inspector shows.
   on('project', () => { renderStageText(); syncInspector(); });
   on('view', syncViewMode);
   on('time clips clip guides audioMove', syncTime);
+  on('time', () => { syncBackdropPreview(); syncInspector(); });
 
   syncTopBar();
   syncHistoryButtons();
@@ -174,6 +183,7 @@ function buildTopBar() {
     app.clearVideos?.();
     deserialize(projectFile);
     resetHistory('open project');
+    await app.ensureClipFonts?.();
     app.timeline.fit();
     // Sources imported on this browser are cached locally, so most projects come
     // back whole; only what the cache has lost still needs the user.
@@ -568,6 +578,8 @@ function buildInspector() {
           ? 'Camera track selected — select a key below to edit its framing.'
         : state.ui.sel?.type === 'particle'
           ? 'Emitter selected — edit it in the Particles panel below.'
+        : state.ui.sel?.type === 'particles'
+          ? 'Particle track selected — select an emitter below to edit its settings.'
         : 'Select a layer on the timeline, or a 起承轉合 point to move a reference line.'));
     return;
   }
@@ -647,9 +659,31 @@ function buildInspector() {
 
     ...typeSection(clip),
 
-    field('Position · scene units', el('div', { class: 'space-y-1.5' },
+    field('Parent layer', el('div', { class: 'space-y-1.5' },
+      el('select', {
+        id: 'clipParent', class: 'sel',
+        onChange: e => {
+          setClipParent(clip.id, e.target.value || null);
+          buildInspector();
+          app.timeline.draw();
+        }
+      },
+        el('option', { value: '', selected: !clip.parentId }, 'None · world position'),
+        ...clipsInOrder()
+          .filter(parent => parent.id !== clip.id && canSetClipParent(clip.id, parent.id))
+          .map(parent => el('option', {
+            value: parent.id, selected: clip.parentId === parent.id
+          }, `${(parent.text || 'Untitled').replace(/\s+/g, ' ').trim().slice(0, 28) || 'Untitled'} · T${parent.track + 1}`))
+      ),
+      el('p', { class: 'text-[10px] leading-snug text-zinc-600' },
+        clip.parentId
+          ? 'This layer follows its parent. Position below is a local offset from that parent.'
+          : 'Choose another text layer to make this one follow its position.'))),
+
+    field(clip.parentId ? 'Offset position · scene units' : 'Position · scene units', el('div', { class: 'space-y-1.5' },
       positionFields(clip.position,
         pos => updateClip(clip.id, { position: { ...(clip.position ?? {}), ...pos } }), 'clipPos'),
+      clip.parentId ? el('div', { id: 'clipWorldPos', class: 'text-[10px] text-zinc-600 font-mono' }) : null,
       el('button', {
         class: 'btn w-full',
         title: 'Place this text on the current camera frame',
@@ -857,6 +891,146 @@ function fontOptions(selected, inherit = null) {
   return opts;
 }
 
+const FONT_WEIGHT_LABELS = {
+  100: 'Thin', 200: 'Extra light', 300: 'Light', 400: 'Regular',
+  500: 'Medium', 600: 'Semi bold', 700: 'Bold', 800: 'Extra bold', 900: 'Black'
+};
+
+const fontWeightLabel = weight => FONT_WEIGHT_LABELS[weight] ?? 'Custom';
+
+/** Families offered by the built-in catalogue plus decoded local faces. */
+function fontFamilyRecords() {
+  const records = new Map();
+  for (const preset of FONT_PRESETS) {
+    if (!records.has(preset.family)) records.set(preset.family, { family: preset.family, label: preset.family });
+  }
+  for (const entry of fontAssets()) {
+    if (!records.has(entry.family)) records.set(entry.family, { family: entry.family, label: entry.family });
+  }
+  return [...records.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/** Real weights available for a family; outlines cannot synthesize a missing one. */
+function fontWeightRecords(family) {
+  const records = new Map();
+  for (const preset of FONT_PRESETS) {
+    if (preset.family === family) records.set(preset.weight, { weight: preset.weight });
+  }
+  for (const entry of fontAssets()) {
+    if (entry.family === family) records.set(entry.weight, { weight: entry.weight });
+  }
+  return [...records.values()].sort((a, b) => a.weight - b.weight);
+}
+
+function layerFontFamilyOptions(clip) {
+  const family = String(clip.fontFamily ?? '').trim();
+  const stageOverride = !family && overridesStyle(clip, 'font');
+  const families = fontFamilyRecords();
+  if (family && !families.some(item => item.family === family)) {
+    families.unshift({ family, label: `${family} (unavailable)` });
+  }
+  return [
+    el('option', {
+      value: '', selected: !family && !stageOverride
+    }, `From stage · ${trim(state.fonts[stageStyle(state.project).font]?.name ?? 'fallback stack', 22)}`),
+    el('optgroup', { label: 'Stage fallback lead' },
+      ...state.fonts.map((entry, i) => el('option', {
+        value: `slot:${i}`, selected: !family && stageOverride && Number(clip.font) === i
+      }, `${i + 1} · ${entry ? trim(entry.name, 22) : '— empty —'}`))),
+    el('optgroup', { label: 'Layer face' },
+      ...families.map(item => el('option', {
+        value: `face:${item.family}`, selected: family === item.family
+      }, item.label)))
+  ];
+}
+
+function layerFontWeightOptions(clip) {
+  const family = String(clip.fontFamily ?? '').trim();
+  const selected = Number(clip.fontWeight);
+  const records = fontWeightRecords(family);
+  if (family && Number.isFinite(selected) && !records.some(item => item.weight === selected)) {
+    records.push({ weight: selected, unavailable: true });
+    records.sort((a, b) => a.weight - b.weight);
+  }
+  return records.length
+    ? records.map(item => el('option', {
+        value: item.weight, selected: item.weight === selected
+      }, `${item.weight} · ${fontWeightLabel(item.weight)}${item.unavailable ? ' · unavailable' : ''}`))
+    : [el('option', { value: '', selected: true }, '— unavailable —')];
+}
+
+function presetForFont(family, weight) {
+  return FONT_PRESETS.find(item => item.family === family && item.weight === Number(weight)) ?? null;
+}
+
+function layerFontSection(clip, tags) {
+  const family = String(clip.fontFamily ?? '').trim();
+  const fontTag = family
+    ? el('button', {
+        class: 'ml-1 px-1 rounded text-sky-400 hover:bg-base-600 normal-case',
+        title: 'Back to the stage typeface',
+        onClick: () => { resetClipStyle(clip.id, 'font'); buildInspector(); app.timeline.draw(); }
+      }, '⟲')
+    : tags.font?.node;
+
+  const chooseFamily = value => {
+    if (!value) {
+      setClipFont(clip.id, { family: null, weight: null, stageSlot: null });
+    } else if (value.startsWith('slot:')) {
+      setClipFont(clip.id, {
+        family: null, weight: null, stageSlot: Number(value.slice(5))
+      });
+    } else {
+      const nextFamily = value.slice(5);
+      const weights = fontWeightRecords(nextFamily).map(item => item.weight);
+      const current = Number(clip.fontWeight);
+      const nextWeight = weights.includes(current) ? current : weights[0];
+      const preset = presetForFont(nextFamily, nextWeight);
+      if (preset) app.loadClipFontPreset(clip.id, preset);
+      else setClipFont(clip.id, {
+        family: nextFamily, weight: nextWeight, stageSlot: null
+      });
+    }
+    app.timeline.draw();
+  };
+
+  const chooseWeight = value => {
+    const weight = Number(value);
+    const preset = presetForFont(family, weight);
+    if (preset) app.loadClipFontPreset(clip.id, preset);
+    else setClipFont(clip.id, { family, weight, stageSlot: null });
+    app.timeline.draw();
+  };
+
+  const loadLocal = () => {
+    const input = $('#fontFile');
+    input.dataset.target = 'clip';
+    input.dataset.clipId = clip.id;
+    input.click();
+  };
+
+  return el('div', { class: 'space-y-1.5' },
+    el('span', { class: 'lbl flex items-center' }, 'Typeface', fontTag),
+    el('div', { class: 'grid grid-cols-[minmax(0,1fr)_5.5rem_auto] gap-1.5' },
+      el('select', {
+        class: 'sel min-w-0', title: 'Typeface for this text layer',
+        onChange: e => chooseFamily(e.target.value)
+      }, ...layerFontFamilyOptions(clip)),
+      el('select', {
+        class: 'sel !px-1', title: 'Real font weight for this text layer',
+        disabled: !family,
+        onChange: e => chooseWeight(e.target.value)
+      }, ...layerFontWeightOptions(clip)),
+      el('button', {
+        class: 'btn btn-sq', title: 'Load a font file for this layer only',
+        onClick: loadLocal
+      }, '⤒')),
+    el('p', { class: 'text-[10px] leading-relaxed text-zinc-600' },
+      family
+        ? 'The layer face leads; stage faces fill any missing glyphs.'
+        : 'Inherited from the stage fallback stack.'));
+}
+
 /** The label suffix that says where a field's value comes from. */
 function styleTag(clip, key, onRevert) {
   const host = el('span', { class: 'ml-1 normal-case shrink-0' });
@@ -872,9 +1046,88 @@ function styleTag(clip, key, onRevert) {
   return { node: host, paint };
 }
 
+/** The colour keys that live inside the selected text block. */
+function colorKeySection(clip) {
+  const keys = clipColorKeys(clip);
+  const selected = selectedClipColorKey();
+  const active = selected && state.ui.sel?.id === clip.id ? selected : null;
+  const inside = state.ui.time >= clip.start - 1e-6 && state.ui.time <= clip.end + 1e-6;
+  const keyList = el('div', { class: 'space-y-1' });
+
+  if (!keys.length) {
+    keyList.append(el('p', { class: 'text-[10px] text-zinc-600' },
+      'No colour keys yet — double-click inside the block or add one at the playhead.'));
+  } else {
+    keys.forEach((key, index) => {
+      const isActive = active?.id === key.id;
+      const row = el('div', {
+        class: 'flex items-center gap-1 rounded border px-1.5 py-1 ' +
+          (isActive ? 'border-zinc-300/60 bg-base-600' : 'border-line bg-base-900'),
+        onClick: () => selectClipColorKey(clip.id, key.id)
+      },
+        el('span', {
+          id: `clipColorKeySwatch_${key.id}`,
+          class: 'w-3 h-3 rotate-45 shrink-0 border border-black/60',
+          style: { background: key.color },
+          title: `Colour key ${index + 1}`
+        }),
+        el('input', {
+          id: `clipColorKeyTime_${key.id}`,
+          type: 'number', step: '0.05', min: 0, max: Math.max(0, clip.end - clip.start),
+          value: round(key.t, 2), title: 'Time inside this layer',
+          class: 'inp !w-[70px] !py-0.5 !text-[10px] font-mono text-center',
+          onClick: e => e.stopPropagation(),
+          onChange: e => {
+            updateClipColorKey(clip.id, key.id, { t: +e.target.value || 0 });
+            e.target.blur();
+            app.timeline.draw();
+          }
+        }),
+        el('span', { class: 'text-[9px] text-zinc-600' }, 's'),
+        el('span', {
+          id: `clipColorKeyLabel_${key.id}`,
+          class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-500'
+        },
+          isActive ? `Key ${index + 1} · selected` : `Key ${index + 1}`),
+        el('select', {
+          class: 'sel !w-[76px] !py-0.5 !text-[10px]', title: 'Easing out of this colour key',
+          onClick: e => e.stopPropagation(),
+          onChange: e => updateClipColorKey(clip.id, key.id, { ease: e.target.value })
+        }, ...Object.entries(EASES).map(([id, ease]) =>
+          el('option', { value: id, selected: key.ease === id }, ease.label))),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Delete this colour key',
+          onClick: e => { e.stopPropagation(); removeClipColorKey(clip.id, key.id); app.timeline.draw(); }
+        }, '✕')
+      );
+      keyList.append(row);
+    });
+  }
+
+  return el('div', { class: 'rounded-md border border-line bg-base-900 p-1.5 space-y-1.5' },
+    el('div', { class: 'flex items-center gap-1.5' },
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500 flex-1' }, 'Colour animation'),
+      el('span', { class: 'chip' }, `${keys.length} key${keys.length === 1 ? '' : 's'}`),
+      el('button', {
+        id: 'btnClipColorKey',
+        class: 'btn !px-1.5 !py-1 !text-[10px]', disabled: !inside,
+        title: inside ? 'Add or select a colour key at the playhead' : 'Move the playhead inside this layer first',
+        onClick: () => { addClipColorKey(clip.id, state.ui.time); app.timeline.draw(); }
+      }, '+ Keyframe'),
+      active ? el('button', {
+        class: 'btn !px-1.5 !py-1 !text-[10px]', title: 'Edit the layer base colour instead of the selected key',
+        onClick: () => { selectClip(clip.id, 'set'); app.timeline.draw(); }
+      }, 'Edit base') : null
+    ),
+    keyList
+  );
+}
+
 /** Typeface, colour and the type settings, each inherited until it is touched. */
 function typeSection(clip) {
   const style = clipStyle(clip, state.project);
+  const selected = selectedClipColorKey();
+  const key = selected && state.ui.sel?.id === clip.id ? selected : null;
   const tags = {};
   const revert = key => {
     resetClipStyle(clip.id, key);
@@ -886,11 +1139,28 @@ function typeSection(clip) {
     tags[key] = t;
     return t.node;
   };
+  // Keep the existing stage-slot override indicator for legacy layer settings;
+  // a layer-local face replaces it with its own reset control below.
+  tag('font');
   // Setting a field is what claims it from the stage, so the tag follows the
   // edit without rebuilding the panel under the pointer.
   const set = (key, value) => { updateClip(clip.id, { [key]: value }); tags[key]?.paint(); };
   const row = (key, control) => el('div', {},
     el('span', { class: 'lbl flex items-center' }, STYLE_LABEL[key], tag(key)), control);
+  const colorRow = el('div', {},
+    el('span', { class: 'lbl flex items-center' },
+      STYLE_LABEL.color,
+      key
+        ? el('span', { class: 'ml-1 normal-case text-sky-400' },
+            `key ${clipColorKeys(clip).findIndex(item => item.id === key.id) + 1}`)
+        : tag('color')),
+    el('input', {
+      type: 'color', value: key?.color ?? style.color,
+      class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
+      onInput: e => key
+        ? updateClipColorKey(clip.id, key.id, { color: e.target.value })
+        : set('color', e.target.value)
+    }));
 
   return [
     el('div', { class: 'flex items-center justify-between pt-1' },
@@ -901,21 +1171,15 @@ function typeSection(clip) {
         onClick: () => { resetClipStyle(clip.id); buildInspector(); app.timeline.draw(); }
       }, 'All from stage')),
 
-    row('font', el('select', {
-      class: 'sel',
-      onChange: e => { set('font', e.target.value === '' ? null : +e.target.value); buildInspector(); }
-    }, ...fontOptions(overridesStyle(clip, 'font') ? Number(clip.font) : null,
-                      stageStyle(state.project).font))),
+    layerFontSection(clip, tags),
 
     el('div', { class: 'grid grid-cols-2 gap-2' },
-      row('color', el('input', {
-        type: 'color', value: style.color,
-        class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
-        onInput: e => set('color', e.target.value)
-      })),
+      colorRow,
       row('align', el('select', { class: 'sel', onChange: e => set('align', e.target.value) },
         ...ALIGNMENTS.map(a =>
           el('option', { value: a, selected: style.align === a }, a[0].toUpperCase() + a.slice(1)))))),
+
+    colorKeySection(clip),
 
     slider('Size', style.size, 0.03, 0.9, 0.005, v => set('size', v), 'of short edge', tag('size')),
     slider('Line height', style.lineHeight, 0.6, 2.4, 0.01, v => set('lineHeight', v), null, tag('lineHeight')),
@@ -968,6 +1232,10 @@ const stageSummary = clip =>
 const inspectorKey = (clip, groupSize) =>
   'clip:' + clip.id + '|' + STAGE_KEYS.map(key => clipStage(clip, key).effect).join(',') +
   '|' + groupSize +
+  '|font:' + (clip.fontFamily ?? '') + ':' + (clip.fontWeight ?? '') + ':' + (clip.font ?? '') +
+  '|parent:' + (clip.parentId ?? '') +
+  '|colorKeys:' + clipColorKeys(clip).map(key => key.id).join(',') +
+  '|colorKey:' + (state.ui.sel?.colorKeyId ?? '') +
   // Inherited fields show the stage's values, so a change there redraws them.
   '|' + TEXT_STYLE_KEYS.map(key => stageStyle(state.project)[key]).join(',');
 
@@ -1087,9 +1355,10 @@ function slider(label, value, min, max, step, onChange, hint = null, badge = nul
 }
 
 /**
- * Three editable world-space coordinates shared by text and camera objects.
- * `idPrefix` names the inputs so another control — the stage move handle —
- * can write its result back into them without rebuilding the panel.
+ * Three editable scene-space coordinates shared by text and camera objects.
+ * Root layers and camera keys use world coordinates; a child layer displays
+ * its local offset. `idPrefix` names the inputs so another control — the stage
+ * move handle — can write its result back without rebuilding the panel.
  */
 function positionFields(position = {}, onChange, idPrefix = '') {
   const p = { x: Number(position.x) || 0, y: Number(position.y) || 0, z: Number(position.z) || 0 };
@@ -1153,11 +1422,39 @@ function syncInspector() {
     }
     const lock = $('#inspLock');
     if (lock && document.activeElement !== lock) lock.checked = clip.locked === true;
+    const parent = $('#clipParent');
+    if (parent && document.activeElement !== parent) parent.value = clip.parentId ?? '';
     // Dragging the layer on stage writes here, so the numbers follow the handle.
     for (const axis of ['x', 'y', 'z']) {
       const n = $('#clipPos' + axis.toUpperCase());
       if (n && document.activeElement !== n) n.value = round(Number(clip.position?.[axis]) || 0, 1);
     }
+    const world = $('#clipWorldPos');
+    if (world) {
+      const p = clipWorldPosition(clip) ?? { x: 0, y: 0, z: 0 };
+      world.textContent = `world  x ${round(p.x, 1)}   y ${round(p.y, 1)}   z ${round(p.z, 1)}`;
+    }
+    const addColorKey = $('#btnClipColorKey');
+    if (addColorKey) {
+      const inside = state.ui.time >= clip.start - 1e-6 && state.ui.time <= clip.end + 1e-6;
+      addColorKey.disabled = !inside;
+      addColorKey.title = inside
+        ? 'Add or select a colour key at the playhead'
+        : 'Move the playhead inside this layer first';
+    }
+    const keys = clipColorKeys(clip);
+    const activeKey = selectedClipColorKey();
+    keys.forEach((key, index) => {
+      const time = $(`#clipColorKeyTime_${key.id}`);
+      if (time) {
+        time.max = Math.max(0, clip.end - clip.start);
+        if (document.activeElement !== time) time.value = round(key.t, 2);
+      }
+      const swatch = $(`#clipColorKeySwatch_${key.id}`);
+      if (swatch) swatch.style.background = key.color;
+      const label = $(`#clipColorKeyLabel_${key.id}`);
+      if (label) label.textContent = activeKey?.id === key.id ? `Key ${index + 1} · selected` : `Key ${index + 1}`;
+    });
   } else if (guide) {
     const g = guide.guide, lv = guide.level;
     const picked = selectedGuideIndices(lv.key);
@@ -1787,7 +2084,13 @@ let fontSlotBusy = -1;
 function buildFontPanel() {
   $('#fontFile').addEventListener('change', e => {
     const f = e.target.files?.[0];
-    if (f) app.loadFontFile(f, +e.target.dataset.slot || 0);
+    if (f && e.target.dataset.target === 'clip' && e.target.dataset.clipId) {
+      app.loadClipFontFile(f, e.target.dataset.clipId);
+    } else if (f) {
+      app.loadFontFile(f, +e.target.dataset.slot || 0);
+    }
+    delete e.target.dataset.target;
+    delete e.target.dataset.clipId;
     e.target.value = '';
   });
   on('fontBusy', slot => { fontSlotBusy = slot; renderFontSlots(); });
@@ -2077,7 +2380,72 @@ function buildParticlePanel() {
     if (!e) { toast('Add an emitter first'); return; }
     if (!duplicateParticleEmitter(e.id)) toast(`At most ${MAX_EMITTERS} emitters`);
   });
+  $('#btnCopyEmitter').addEventListener('click', copySelectedEmitterToClipboard);
+  $('#btnPasteEmitter').addEventListener('click', pasteEmitterFromClipboard);
   renderParticlePanel();
+}
+
+function rememberSelectedEmitter() {
+  const id = activeEmitterId();
+  const emitter = id ? particleEmitters().find(e => e.id === id) : null;
+  if (!emitter) {
+    toast('Select an emitter first');
+    return null;
+  }
+  emitterClipboard = copyEmitterData(emitter.id);
+  return emitterClipboard;
+}
+
+async function copySelectedEmitterToClipboard() {
+  const data = rememberSelectedEmitter();
+  if (!data) return false;
+  try {
+    await navigator.clipboard?.writeText(clipboardText(data));
+  } catch {
+    // The in-memory payload still makes copy/paste work when browser clipboard
+    // access is unavailable.
+  }
+  toast('Emitter copied');
+  return true;
+}
+
+function parseEmitterClipboard(text) {
+  if (!text) return null;
+  try {
+    const data = JSON.parse(text);
+    return data?.format === EMITTER_CLIPBOARD_FORMAT && data.emitter ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function pasteEmitterData(data) {
+  const emitter = pasteEmitter(data, state.ui.time);
+  if (!emitter) {
+    toast(particleEmitters().length >= MAX_EMITTERS
+      ? `At most ${MAX_EMITTERS} emitters`
+      : 'Could not paste emitter');
+    return false;
+  }
+  app.timeline.draw();
+  toast('Emitter pasted at playhead');
+  return true;
+}
+
+async function pasteEmitterFromClipboard() {
+  let data = null;
+  try {
+    const text = await navigator.clipboard?.readText();
+    data = parseEmitterClipboard(text);
+  } catch {
+    // Fall back to the last in-app copy below.
+  }
+  if (!data) data = emitterClipboard;
+  if (!data) {
+    toast('Copy an emitter first');
+    return false;
+  }
+  return pasteEmitterData(data);
 }
 
 // Blur first: a select still holding focus would block the panel rebuild that
@@ -2097,6 +2465,181 @@ const colorField = (label, value, onChange) =>
 
 const emitterLabel = (e, i) =>
   e.name || `${PARTICLE_SHAPES.find(s => s.id === e.shape)?.label ?? e.shape} ${i + 1}`;
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const CURVE_VIEW = Object.freeze({
+  width: 200, height: 86,
+  left: 14, right: 197, top: 5, bottom: 69
+});
+
+function svgEl(tag, attrs = {}, ...kids) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value !== null && value !== undefined) n.setAttribute(key, value);
+  }
+  for (const k of kids.flat()) if (k != null) n.append(k.nodeType ? k : document.createTextNode(k));
+  return n;
+}
+
+function curvePoint(values, i) {
+  const x = CURVE_VIEW.left + (CURVE_VIEW.right - CURVE_VIEW.left) * i / (values.length - 1);
+  const value = clamp(Number(values[i]) || 0, 0, 1);
+  const y = CURVE_VIEW.bottom - (CURVE_VIEW.bottom - CURVE_VIEW.top) * value;
+  return [x, y];
+}
+
+function curvePath(values, close = false) {
+  const points = values.map((_, i) => curvePoint(values, i));
+  const d = points.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
+  return close
+    ? `${d} L${CURVE_VIEW.right},${CURVE_VIEW.bottom} L${CURVE_VIEW.left},${CURVE_VIEW.bottom} Z`
+    : d;
+}
+
+function miniCurvePath(values) {
+  const points = values.map((_, i) => {
+    const x = 1 + 22 * i / (values.length - 1);
+    const y = 11 - 10 * clamp(Number(values[i]) || 0, 0, 1);
+    return `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return points.join(' ');
+}
+
+function sameCurve(a, b) {
+  return a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < 0.015);
+}
+
+/**
+ * A sampled 0..1 curve editor. The graph owns its pointer gesture so a
+ * continuous draw does not rebuild the panel on every sample update.
+ */
+function curveEditor(label, values, onChange) {
+  const initial = normalizeParticleCurve(values);
+  const line = svgEl('path', { class: 'curve-line', d: curvePath(initial) });
+  const fill = svgEl('path', { class: 'curve-fill', d: curvePath(initial, true) });
+  const graph = svgEl('svg', {
+    class: 'curve-plot', viewBox: `0 0 ${CURVE_VIEW.width} ${CURVE_VIEW.height}`,
+    preserveAspectRatio: 'none', role: 'application', tabindex: '0',
+    'aria-label': `${label}. Drag to draw the curve.`
+  });
+
+  graph.append(
+    svgEl('rect', {
+      class: 'curve-bg', x: CURVE_VIEW.left, y: CURVE_VIEW.top,
+      width: CURVE_VIEW.right - CURVE_VIEW.left, height: CURVE_VIEW.bottom - CURVE_VIEW.top,
+      rx: 1.5
+    }),
+    ...[0.25, 0.5, 0.75].map(v => svgEl('line', {
+      class: 'curve-grid', x1: CURVE_VIEW.left, x2: CURVE_VIEW.right,
+      y1: CURVE_VIEW.bottom - (CURVE_VIEW.bottom - CURVE_VIEW.top) * v,
+      y2: CURVE_VIEW.bottom - (CURVE_VIEW.bottom - CURVE_VIEW.top) * v
+    })),
+    ...[0.25, 0.5, 0.75].map(v => svgEl('line', {
+      class: 'curve-grid', y1: CURVE_VIEW.top, y2: CURVE_VIEW.bottom,
+      x1: CURVE_VIEW.left + (CURVE_VIEW.right - CURVE_VIEW.left) * v,
+      x2: CURVE_VIEW.left + (CURVE_VIEW.right - CURVE_VIEW.left) * v
+    })),
+    fill,
+    line,
+    svgEl('line', { class: 'curve-axis', x1: CURVE_VIEW.left, x2: CURVE_VIEW.left, y1: CURVE_VIEW.top, y2: CURVE_VIEW.bottom }),
+    svgEl('line', { class: 'curve-axis', x1: CURVE_VIEW.left, x2: CURVE_VIEW.right, y1: CURVE_VIEW.bottom, y2: CURVE_VIEW.bottom }),
+    svgEl('text', { class: 'curve-y-label', x: 8, y: CURVE_VIEW.top + 3 }, '1'),
+    svgEl('text', { class: 'curve-y-label', x: 8, y: CURVE_VIEW.bottom + 3 }, '0'),
+    svgEl('text', { class: 'curve-x-label', x: CURVE_VIEW.left, y: CURVE_VIEW.height - 1 }, 'BIRTH'),
+    svgEl('text', { class: 'curve-x-label', x: CURVE_VIEW.right, y: CURVE_VIEW.height - 1, 'text-anchor': 'end' }, 'DEATH')
+  );
+
+  const presetButtons = PARTICLE_CURVE_PRESETS.map(preset => el('button', {
+    class: 'curve-preset', type: 'button', title: preset.label,
+    'aria-label': `${label}: ${preset.label}`,
+    onClick: ev => {
+      ev.stopPropagation();
+      onChange([...preset.values]);
+    }
+  }, svgEl('svg', { viewBox: '0 0 24 12', 'aria-hidden': 'true' },
+    svgEl('path', { d: miniCurvePath(preset.values) }))));
+
+  const updateGraph = nextValues => {
+    const next = normalizeParticleCurve(nextValues);
+    fill.setAttribute('d', curvePath(next, true));
+    line.setAttribute('d', curvePath(next));
+    presetButtons.forEach((button, i) => {
+      const active = sameCurve(next, PARTICLE_CURVE_PRESETS[i].values);
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+  };
+
+  const valueAtPointer = ev => {
+    const rect = graph.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const x = clamp((ev.clientX - rect.left) / rect.width * CURVE_VIEW.width,
+      CURVE_VIEW.left, CURVE_VIEW.right);
+    const y = clamp((ev.clientY - rect.top) / rect.height * CURVE_VIEW.height,
+      CURVE_VIEW.top, CURVE_VIEW.bottom);
+    return {
+      index: Math.round((x - CURVE_VIEW.left) / (CURVE_VIEW.right - CURVE_VIEW.left) * (PARTICLE_CURVE_POINTS - 1)),
+      value: clamp(1 - (y - CURVE_VIEW.top) / (CURVE_VIEW.bottom - CURVE_VIEW.top), 0, 1)
+    };
+  };
+
+  const applyPointer = ev => {
+    const gesture = activeCurveGesture;
+    if (!gesture || gesture.graph !== graph) return;
+    const point = valueAtPointer(ev);
+    if (!point) return;
+    const { index, value } = point;
+    if (gesture.lastIndex === null) {
+      gesture.values[index] = value;
+    } else if (gesture.lastIndex === index) {
+      gesture.values[index] = value;
+    } else {
+      const distance = index - gesture.lastIndex;
+      const from = Math.min(gesture.lastIndex, index);
+      const to = Math.max(gesture.lastIndex, index);
+      for (let i = from; i <= to; i++) {
+        const t = (i - gesture.lastIndex) / distance;
+        gesture.values[i] = gesture.lastValue + (value - gesture.lastValue) * t;
+      }
+    }
+    gesture.lastIndex = index;
+    gesture.lastValue = value;
+    updateGraph(gesture.values);
+    onChange(gesture.values.slice());
+  };
+
+  const finishPointer = () => {
+    if (!activeCurveGesture || activeCurveGesture.graph !== graph) return;
+    activeCurveGesture = null;
+    renderParticlePanel();
+  };
+
+  graph.addEventListener('pointerdown', ev => {
+    if (ev.button !== undefined && ev.button !== 0) return;
+    ev.preventDefault();
+    const point = valueAtPointer(ev);
+    if (!point) return;
+    activeCurveGesture = {
+      graph, values: normalizeParticleCurve(values).slice(),
+      lastIndex: null, lastValue: point.value
+    };
+    graph.setPointerCapture?.(ev.pointerId);
+    applyPointer(ev);
+  });
+  graph.addEventListener('pointermove', applyPointer);
+  graph.addEventListener('pointerup', finishPointer);
+  graph.addEventListener('pointercancel', finishPointer);
+  graph.addEventListener('lostpointercapture', finishPointer);
+
+  updateGraph(initial);
+  return el('div', { class: 'curve-editor' },
+    el('div', { class: 'flex items-center justify-between gap-2' },
+      el('span', { class: 'lbl !mb-0' }, label),
+      el('span', { class: 'curve-hint' }, 'drag to draw')),
+    el('div', { class: 'flex items-stretch gap-1.5' },
+      graph,
+      el('div', { class: 'curve-presets', 'aria-label': `${label} presets` }, ...presetButtons)));
+}
 
 function renderEmitterList() {
   const host = $('#emitterList');
@@ -2169,14 +2712,16 @@ function emitterWindow(s) {
       }, 'Out at playhead')));
 }
 
-function renderParticlePanel() {
+function renderParticlePanel(force = false) {
   renderEmitterList();
   const host = $('#particlePanel');
-  if (!host || holdsFocus(host)) return;      // never rebuild under a dragged slider
+  if (!host || (!force && holdsFocus(host)) || activeCurveGesture) return; // keep a live graph gesture intact
 
   // Only the emitter list stays up front; the settings themselves wait until an
   // emitter track is the selection, the way the Camera panel does.
-  const s = state.ui.sel?.type === 'particle' ? selectedEmitter() : null;
+  const s = state.ui.sel?.type === 'particle'
+    ? particleEmitters().find(e => e.id === state.ui.sel.id) ?? null
+    : null;
   host.classList.toggle('hidden', !s);
   $('#particleHint')?.classList.toggle('hidden', !!s || !particleEmitters().length);
   host.replaceChildren();
@@ -2228,6 +2773,7 @@ function renderParticlePanel() {
     sl('Burst on beat', 'burst', 0, 200, 1),
     sl('Lifetime', 'life', 0.1, 6, 0.05, 'seconds'),
     sl('Size', 'size', 0.5, 120, 0.5),
+    curveEditor('Size over life', s.sizeOverLife, values => set({ sizeOverLife: values })),
     sl('Speed', 'speed', 0, 2000, 5),
     directional ? sl('Direction', 'direction', 0, 360, 1, 'degrees') : null,
     sl('Spread', 'spread', 0, 1, 0.01),
@@ -2242,6 +2788,7 @@ function renderParticlePanel() {
       colorField('Newborn', s.colorA, v => set({ colorA: v })),
       colorField('Dying', s.colorB, v => set({ colorB: v }))),
     sl('Opacity', 'opacity', 0, 1, 0.01),
+    curveEditor('Opacity over life', s.opacityOverLife, values => set({ opacityOverLife: values })),
     el('label', { class: 'tog' },
       el('input', {
         type: 'checkbox', class: 'accent-amber-500', checked: s.additive,
@@ -2343,16 +2890,16 @@ function renderBackdropPanel() {
           color('Top left', 0), color('Top right', 1), color('Bottom left', 2), color('Bottom right', 3))
       : el('div', { class: 'grid grid-cols-2 gap-2' }, color('Start', 0), color('End', 1));
 
-  host.replaceChildren(
+  host.replaceChildren(...[
     el('div', { class: 'flex items-center justify-between' },
       el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500' }, 'Backdrop colour'),
       el('span', { class: 'chip' }, `${keys.length} key${keys.length === 1 ? '' : 's'}`)),
 
     el('div', { class: 'rounded-md border border-line bg-base-900 p-2 space-y-2' },
-      el('div', { class: 'h-12 rounded border border-white/10 shadow-inner', style: { background: backdropCss(live) },
+      el('div', { id: 'backdropPreview', class: 'h-12 rounded border border-white/10 shadow-inner', style: { background: backdropCss(live) },
                  title: `Backdrop at ${state.ui.time.toFixed(2)}s` }),
       el('div', { class: 'flex items-center gap-1.5' },
-        el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400' }, keyLabel),
+        el('span', { id: 'backdropCurrentLabel', class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400' }, keyLabel),
         el('button', {
           class: 'btn !px-1.5 !py-1 !text-[10px]', title: 'Add or select a key at the playhead',
           onClick: () => { addBackdropKey(state.ui.time); app.timeline.draw(); renderBackdropPanel(); }
@@ -2368,6 +2915,7 @@ function renderBackdropPanel() {
         }, 'Clear keys'))),
 
     selectField('Type', b.mode, BACKDROP_MODES, mode => {
+      document.activeElement?.blur();
       setBackdrop({ mode });
       renderBackdropPanel();
       app.timeline.draw();
@@ -2379,14 +2927,22 @@ function renderBackdropPanel() {
       : null,
     b.mode === 'radial'
       ? el('div', { class: 'space-y-2.5' },
-          slider('Center X', target.center.x, 0, 1, 0.01, value => setValue({ center: { x: value } }), '%'),
-          slider('Center Y', target.center.y, 0, 1, 0.01, value => setValue({ center: { y: value } }), '%'),
+          slider('Center X', target.center.x * 100, 0, 100, 1, value => setValue({ center: { x: value / 100 } }), '%'),
+          slider('Center Y', target.center.y * 100, 0, 100, 1, value => setValue({ center: { y: value / 100 } }), '%'),
           slider('Radius', target.radius, 0.1, 2, 0.01, value => setValue({ radius: value }), 'frame units'))
       : null,
     el('div', { class: 'pt-1 border-t border-line/70' }, keyList),
     el('p', { class: 'text-[10px] leading-relaxed text-zinc-600' },
       `${modeLabel} is rendered behind backdrop video. Add a key at one time, change its colours, then add another key to transition between them.`)
-  );
+  ].filter(Boolean));
+}
+
+function syncBackdropPreview() {
+  const preview = $('#backdropPreview');
+  if (!preview) return;
+  const live = backdropAt(backdrop(), state.ui.time);
+  preview.style.background = backdropCss(live);
+  preview.title = `Backdrop at ${state.ui.time.toFixed(2)}s`;
 }
 
 function buildLookPanel() {
@@ -2466,22 +3022,32 @@ function buildShortcuts() {
 
     const frame = 1 / state.project.fps;
     const clip = selectedClip();
+    const emitter = state.ui.sel?.type === 'particle' ? selectedEmitter() : null;
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
       e.preventDefault();
       if (clip) duplicateClip(clip.id);
+      else if (emitter) duplicateParticleEmitter(emitter.id);
       return;
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c') {
-      if (!clip) return;
+      if (!clip && !emitter) return;
       e.preventDefault();
-      copySelectedClipToClipboard();
+      if (clip) copySelectedClipToClipboard();
+      else copySelectedEmitterToClipboard();
       return;
     }
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v' && clipClipboard) {
-      e.preventDefault();
-      pasteClipData(clipClipboard);
-      return;
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') {
+      if (clip && clipClipboard) {
+        e.preventDefault();
+        pasteClipData(clipClipboard);
+        return;
+      }
+      if (emitter) {
+        e.preventDefault();
+        pasteEmitterFromClipboard();
+        return;
+      }
     }
     switch (e.key) {
       case ' ': e.preventDefault(); app.togglePlay(); break;

@@ -14,7 +14,7 @@ import { cameraAt, FOV, defaultCameraPosition, cameraKeyEntries } from './camera
 import { VIDEO_CHANNEL_KINDS } from './video/engine.js';
 import { ParticleField, MAX_COLLIDERS } from './particles.js';
 import { clamp } from './util.js';
-import { backdropAt } from './state.js';
+import { backdropAt, clipColorAt, clipFont, clipWorldPosition } from './state.js';
 
 const OVERLAY_FRAG = `
 uniform float uVignette, uGrain, uTime;
@@ -37,6 +37,7 @@ const BACKDROP_FRAG = `
 uniform int uBackdropMode;
 uniform vec3 uBackdropColorA, uBackdropColorB, uBackdropColorC, uBackdropColorD;
 uniform float uBackdropAngle, uBackdropRadius;
+uniform float uBackdropAspect;
 uniform vec2 uBackdropCenter;
 varying vec2 vUv;
 
@@ -51,7 +52,9 @@ void main() {
     float amount = 0.5 + dot(p - vec2(0.5), dir) / (2.0 * extent);
     color = mix(uBackdropColorA, uBackdropColorB, clamp(amount, 0.0, 1.0));
   } else if (uBackdropMode == 2) {
-    float amount = distance(p, uBackdropCenter) / max(0.0001, uBackdropRadius);
+    vec2 delta = p - uBackdropCenter;
+    delta.x *= uBackdropAspect;
+    float amount = length(delta) / max(0.0001, uBackdropRadius);
     color = mix(uBackdropColorA, uBackdropColorB, clamp(amount, 0.0, 1.0));
   } else if (uBackdropMode == 3) {
     vec3 top = mix(uBackdropColorA, uBackdropColorB, p.x);
@@ -174,6 +177,7 @@ export class StageRenderer {
         uBackdropColorD: { value: new THREE.Color('#08090c') },
         uBackdropAngle: { value: 0 },
         uBackdropRadius: { value: 0.75 },
+        uBackdropAspect: { value: 1 },
         uBackdropCenter: { value: new THREE.Vector2(0.5, 0.5) }
       },
       vertexShader: BACKDROP_VERT,
@@ -388,6 +392,7 @@ export class StageRenderer {
     uniforms.uBackdropColorD.value.set(value.colors[3]);
     uniforms.uBackdropAngle.value = (Number(value.angle) || 0) * Math.PI / 180;
     uniforms.uBackdropRadius.value = Number(value.radius) || 0.75;
+    uniforms.uBackdropAspect.value = Math.max(0.0001, Number(frameW) / Math.max(0.0001, Number(frameH)));
     uniforms.uBackdropCenter.value.set(
       Number.isFinite(Number(value.center?.x)) ? Number(value.center.x) : 0.5,
       Number.isFinite(Number(value.center?.y)) ? Number(value.center.y) : 0.5
@@ -726,7 +731,7 @@ export class StageRenderer {
     for (const clip of draw) {
       const rec = this.groups.get(clip.id);
       if (!rec) continue;
-      const pos = clip.position ?? { x: 0, y: 0, z: 0 };
+      const pos = clipWorldPosition(clip) ?? clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
       const active = clipLive(clip, time, project);
@@ -753,7 +758,7 @@ export class StageRenderer {
     for (const clip of draw) {
       const rec = this.groups.get(clip.id);
       if (!rec) continue;
-      const pos = clip.position ?? { x: 0, y: 0, z: 0 };
+      const pos = clipWorldPosition(clip) ?? clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
       const active = clipLive(clip, time, project);
@@ -928,6 +933,7 @@ export class StageRenderer {
       sinceBeat, beatIndex, p, W: project.width, H: project.height, size: rec.sizePx,
       stage: at.key, clip
     };
+    const color = clipColorAt(clip, project, time);
 
     for (let i = 0; i < n; i++) {
       const gl = rec.glyphs[i];
@@ -940,6 +946,7 @@ export class StageRenderer {
       c.i = i;
       if (animate) applyEffect(stage.effect, g, c);
 
+      gl.material.color.set(color);
       gl.mesh.position.set(g.x, g.y, g.z);
       gl.mesh.rotation.set(g.rx, g.ry, g.rz);
       gl.mesh.scale.set(g.sx || 1e-4, g.sy || 1e-4, g.sz || 1e-4);
@@ -1003,13 +1010,20 @@ export class StageRenderer {
     const draw = inSpace
       ? [...clips].sort((a, b) => b.track - a.track || a.start - b.start)
       : active;
+    const hasAnyFont = stack.length > 0 || draw.some(clip => !!clipFont(clip));
 
     let glyphCount = 0;
     for (const clip of draw) {
-      if (!stack.length) continue;
-      const rec = this._group(clip, project, orderFonts(slots, clipStyle(clip, project).font));
+      const style = clipStyle(clip, project);
+      const stageStack = orderFonts(slots, style.font);
+      const layerFont = clipFont(clip);
+      if (!stageStack.length && !layerFont) continue;
+      const fontsForClip = layerFont
+        ? [layerFont, ...stageStack.filter(font => font !== layerFont)]
+        : stageStack;
+      const rec = this._group(clip, project, fontsForClip);
       rec.group.visible = true;
-      const pos = clip.position ?? { x: 0, y: 0, z: 0 };
+      const pos = clipWorldPosition(clip) ?? clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
       const isActive = clipLive(clip, time, project);
@@ -1019,7 +1033,7 @@ export class StageRenderer {
 
     this._updateParticles(project, time, beats, active, inSpace ? this.editorCamera.fov : FOV);
 
-    if (inSpace) this._renderOutputPreview({ time, project, beats, draw: stack.length ? draw : [] });
+    if (inSpace) this._renderOutputPreview({ time, project, beats, draw: hasAnyFont ? draw : [] });
 
     if (inSpace && selection?.type === 'clip') {
       const rec = this.groups.get(selection.id);

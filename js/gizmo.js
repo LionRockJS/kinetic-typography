@@ -18,7 +18,7 @@
 // With several layers selected the box still belongs to the primary one, but
 // the drag carries the rest of the selection along by the same offset.
 
-import { state, clips, selectedClips, updateClip } from './state.js';
+import { state, clips, selectedClips, clipWorldPosition, setClipWorldPosition } from './state.js';
 import { $, clamp, round } from './util.js';
 
 // The unrotated corners of the text block, as fractions of its half extents.
@@ -54,7 +54,7 @@ export class StageGizmo {
   }
 
   static _pos(clip) {
-    const p = clip.position ?? {};
+    const p = clipWorldPosition(clip) ?? clip.position ?? {};
     return { x: Number(p.x) || 0, y: Number(p.y) || 0, z: Number(p.z) || 0 };
   }
 
@@ -177,15 +177,25 @@ export class StageGizmo {
     const d = this.drag;
     const dx = x - d.pos.x, dy = y - d.pos.y;
     const group = d.group?.length ? d.group : [{ id: d.id, ...d.pos }];
+    const selected = new Set(group.map(g => g.id));
+    const hasSelectedAncestor = id => {
+      let clip = clips().find(c => c.id === id);
+      const seen = new Set();
+      while (clip?.parentId) {
+        if (seen.has(clip.id)) return false;
+        seen.add(clip.id);
+        if (selected.has(clip.parentId)) return true;
+        clip = clips().find(c => c.id === clip.parentId);
+      }
+      return false;
+    };
     for (const g of group) {
-      const clip = clips().find(c => c.id === g.id);
-      if (!clip) continue;
-      const lead = g.id === d.id;
-      updateClip(g.id, {
-        position: { ...(clip.position ?? {}),
-                    x: lead ? x : round(g.x + dx, 2),
-                    y: lead ? y : round(g.y + dy, 2),
-                    z: lead ? d.pos.z : g.z }
+      // A selected child already follows a selected parent. Moving both would
+      // apply the same delta twice, so move only the highest selected layers;
+      // unselected descendants then follow naturally.
+      if (hasSelectedAncestor(g.id)) continue;
+      setClipWorldPosition(g.id, {
+        x: round(g.x + dx, 2), y: round(g.y + dy, 2), z: g.z
       });
     }
     this.sync();

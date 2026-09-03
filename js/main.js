@@ -3,6 +3,7 @@
 import { state, clips, track, audioClips, savedAudioClips, audioClip, addAudioClip, removeAudioClip,
          initProject, on, emit, setTime, setDuration,
          syncBeatTimes, beatTimes, setMetro, setFont, fontSlots, fontsReady, select,
+         fontAssets, registerFontAsset, setClipFont,
          selectCameraKey,
          videoChannels, videoChannel, videoClips, videoClip, addVideoClip,
          removeVideoClip, makeVideoChannel } from './state.js';
@@ -395,8 +396,8 @@ function setMetroEnabled(on) {
 async function loadFontUrl(preset, slot = 0) {
   try {
     emit('fontBusy', slot);
-    const font = await loadFontFromUrl(preset.url, preset.label);
-    setFont(slot, { font, name: preset.label, preset: preset.id });
+    const entry = await loadPresetAsset(preset);
+    setFont(slot, entry);
     renderer.invalidate();
     dirty = true;
     if (slot > 0) toast(`Fallback ${slot + 1}: ${preset.label}`);
@@ -410,13 +411,95 @@ async function loadFontUrl(preset, slot = 0) {
 async function loadFontFile(file, slot = 0) {
   try {
     const font = await loadFontFromFile(file);
-    setFont(slot, { font, name: file.name.replace(/\.[^.]+$/, ''), preset: null });
+    const entry = registerFontAsset({
+      font, name: file.name.replace(/\.[^.]+$/, ''), preset: null,
+      family: font.__familyName, weight: font.__weight
+    });
+    setFont(slot, entry);
     renderer.invalidate();
     dirty = true;
     toast(`${slot === 0 ? 'Typeface' : `Fallback ${slot + 1}`}: ${file.name}`);
   } catch (err) {
     console.error(err);
     toast('That file is not a readable font');
+  }
+}
+
+/** Decode one bundled face once and keep it available to any text layer. */
+async function loadPresetAsset(preset) {
+  const existing = fontAssets().find(entry => entry.preset === preset.id);
+  if (existing) return existing;
+  const font = await loadFontFromUrl(preset.url, preset.label, preset);
+  return registerFontAsset({
+    font, name: preset.label, preset: preset.id,
+    family: preset.family, weight: preset.weight
+  });
+}
+
+/** Apply a bundled face to one layer without changing the stage slots. */
+async function loadClipFontPreset(clipId, preset) {
+  const clip = clips().find(item => item.id === clipId);
+  if (!clip || !preset) return;
+  const previous = {
+    family: clip.fontFamily, weight: clip.fontWeight,
+    stageSlot: Number.isFinite(Number(clip.font)) ? Number(clip.font) : null
+  };
+  setClipFont(clipId, {
+    family: preset.family, weight: preset.weight, stageSlot: null
+  });
+  try {
+    await loadPresetAsset(preset);
+    emit('fonts', state.fonts);
+    renderer.invalidate();
+    dirty = true;
+    toast(`${preset.family} ${preset.weight} applied to this layer`);
+  } catch (err) {
+    console.error(err);
+    setClipFont(clipId, {
+      family: previous.family ?? null, weight: previous.weight ?? null,
+      stageSlot: previous.family ? null : previous.stageSlot
+    });
+    toast('Could not load that layer typeface');
+  }
+}
+
+/** Load a user-supplied face into the runtime library for one layer only. */
+async function loadClipFontFile(file, clipId) {
+  try {
+    const font = await loadFontFromFile(file);
+    const entry = registerFontAsset({
+      font, name: file.name.replace(/\.[^.]+$/, ''), preset: null,
+      family: font.__familyName, weight: font.__weight
+    });
+    setClipFont(clipId, {
+      family: entry.family, weight: entry.weight, stageSlot: null
+    });
+    renderer.invalidate();
+    dirty = true;
+    toast(`${entry.family} ${entry.weight} applied to this layer`);
+  } catch (err) {
+    console.error(err);
+    toast('That layer typeface is not readable');
+  }
+}
+
+/** Rehydrate bundled faces referenced by layers after opening a project. */
+async function ensureClipFonts() {
+  const wanted = new Map();
+  for (const clip of clips()) {
+    const family = String(clip.fontFamily ?? '').trim();
+    const weight = Number(clip.fontWeight);
+    const preset = FONT_PRESETS.find(item => item.family === family && item.weight === weight);
+    if (preset) wanted.set(preset.id, preset);
+  }
+  for (const preset of wanted.values()) {
+    try { await loadPresetAsset(preset); }
+    catch (err) { console.warn(`Could not restore layer typeface ${preset.label}`, err); }
+  }
+  if (wanted.size) {
+    emit('fonts', state.fonts);
+    renderer.invalidate();
+    dirty = true;
   }
 }
 
@@ -521,6 +604,7 @@ async function boot() {
     engine, timeline, renderer,
     togglePlay, play, pause, seek, playRange,
     importAudio, analyzeVoice, clearAudio, loadFontUrl, loadFontFile, clearFont, toggleRecord,
+    loadClipFontPreset, loadClipFontFile, ensureClipFonts,
     importVideo, clearVideo, clearVideos, relinkSavedMedia,
     syncMetro, setMetroEnabled
   });
@@ -595,6 +679,7 @@ async function boot() {
     const preset = FONT_PRESETS.find(f => f.id === wanted[i]);
     if (preset) await loadFontUrl(preset, i);
   }
+  await ensureClipFonts();
   if (!fontsReady()) $('#bootMsg').textContent = 'typeface unavailable — load one from the panel';
   splash.style.opacity = '0';
   setTimeout(() => splash.remove(), 500);

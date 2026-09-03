@@ -26,6 +26,7 @@ const FIXED_STEP = 1 / 60;
 export const MAX_PARTICLES = 4000;      // per emitter
 export const MAX_COLLIDERS = 4000;
 export const MAX_EMITTERS = 8;
+export const PARTICLE_CURVE_POINTS = 24;
 
 export const PARTICLE_SHAPES = [
   { id: 'circle',   label: 'Circle' },
@@ -62,6 +63,48 @@ const textModeIds = TEXT_MODES.map(m => m.id);
 const num = (v, def, min, max) => clamp(Number.isFinite(Number(v)) ? Number(v) : def, min, max);
 const pick = (v, list, def) => (list.includes(v) ? v : def);
 const hex = (v, def) => (typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v) ? v : def);
+
+const curveFrom = fn => Array.from({ length: PARTICLE_CURVE_POINTS }, (_, i) =>
+  clamp(fn(i / (PARTICLE_CURVE_POINTS - 1)), 0, 1));
+
+// Curves are stored as a small, fixed-size list of normalised values. Keeping
+// the samples in the project makes a hand-drawn curve portable while keeping
+// particle updates cheap enough to run on every frame.
+export const PARTICLE_CURVE_PRESETS = Object.freeze([
+  { id: 'constant', label: 'Constant', values: curveFrom(() => 1) },
+  { id: 'fade-out', label: 'Fade out', values: curveFrom(t => 1 - t) },
+  { id: 'fade-in', label: 'Fade in', values: curveFrom(t => t) },
+  { id: 'fade-in-out', label: 'Fade in · out', values: curveFrom(t => Math.sin(Math.PI * t)) },
+  { id: 'fade-out-in', label: 'Fade out · in', values: curveFrom(t => 1 - Math.sin(Math.PI * t)) },
+  { id: 'pulse', label: 'Pulse', values: curveFrom(t => Math.sin(Math.PI * t) ** 3) }
+]);
+
+const defaultCurve = PARTICLE_CURVE_PRESETS.find(p => p.id === 'fade-out').values;
+
+/** Normalise saved curves to the current sample count and safe 0..1 values. */
+export function normalizeParticleCurve(value, fallback = defaultCurve) {
+  if (!Array.isArray(value) || !value.length) return [...fallback];
+  if (value.length === 1) {
+    const v = clamp(Number.isFinite(Number(value[0])) ? Number(value[0]) : fallback[0], 0, 1);
+    return Array.from({ length: PARTICLE_CURVE_POINTS }, () => v);
+  }
+  return Array.from({ length: PARTICLE_CURVE_POINTS }, (_, i) => {
+    const p = i * (value.length - 1) / (PARTICLE_CURVE_POINTS - 1);
+    const lo = Math.floor(p), hi = Math.min(value.length - 1, lo + 1);
+    const a = Number.isFinite(Number(value[lo])) ? Number(value[lo]) : fallback[Math.min(lo, fallback.length - 1)];
+    const b = Number.isFinite(Number(value[hi])) ? Number(value[hi]) : fallback[Math.min(hi, fallback.length - 1)];
+    return clamp(a + (b - a) * (p - lo), 0, 1);
+  });
+}
+
+export function sampleParticleCurve(value, u) {
+  const curve = Array.isArray(value) && value.length ? value : defaultCurve;
+  const p = clamp(u, 0, 1) * (curve.length - 1);
+  const lo = Math.floor(p), hi = Math.min(curve.length - 1, lo + 1);
+  const a = Number.isFinite(Number(curve[lo])) ? Number(curve[lo]) : 0;
+  const b = Number.isFinite(Number(curve[hi])) ? Number(curve[hi]) : a;
+  return clamp(a + (b - a) * (p - lo), 0, 1);
+}
 
 /** Defaults and clamping for one emitter — the serialisable half of the system. */
 export function makeEmitter(props = {}, { duration = 24 } = {}) {
@@ -100,6 +143,7 @@ export function makeEmitter(props = {}, { duration = 24 } = {}) {
 
     size: num(s.size, 9, 0.5, 120),
     sizeJitter: num(s.sizeJitter, 0.5, 0, 1),
+    sizeOverLife: normalizeParticleCurve(s.sizeOverLife),
     spin: num(s.spin, 0.6, 0, 12),
 
     speed: num(s.speed, 90, 0, 2000),
@@ -114,6 +158,7 @@ export function makeEmitter(props = {}, { duration = 24 } = {}) {
     colorA: hex(s.colorA, '#7dd3fc'),
     colorB: hex(s.colorB, '#f472b6'),
     opacity: num(s.opacity, 0.85, 0, 1),
+    opacityOverLife: normalizeParticleCurve(s.opacityOverLife),
     additive: s.additive !== false,
 
     textMode: pick(s.textMode, textModeIds, 'collide'),
@@ -220,6 +265,7 @@ export class ParticleField {
     this.vel = new Float32Array(capacity * 3);
     this.age = new Float32Array(capacity);
     this.ttl = new Float32Array(capacity);
+    this.baseSize = new Float32Array(capacity);
     this.aSize = new Float32Array(capacity);
     this.aAge = new Float32Array(capacity);
     this.aRot = new Float32Array(capacity);
@@ -422,7 +468,8 @@ export class ParticleField {
       this.age[i] = age;
       const u = age / this.ttl[i];
       this.aAge[i] = u;
-      this.aAlpha[i] = Math.min(1, u / 0.12) * Math.min(1, (1 - u) / 0.35);
+      this.aSize[i] = this.baseSize[i] * sampleParticleCurve(s.sizeOverLife, u);
+      this.aAlpha[i] = sampleParticleCurve(s.opacityOverLife, u);
       this.aRot[i] = streak ? Math.atan2(vy, vx) : this.aRot[i] + this.spin[i] * dt;
     }
   }
@@ -434,6 +481,7 @@ export class ParticleField {
       this.pos[a] = this.pos[b]; this.pos[a + 1] = this.pos[b + 1]; this.pos[a + 2] = this.pos[b + 2];
       this.vel[a] = this.vel[b]; this.vel[a + 1] = this.vel[b + 1]; this.vel[a + 2] = this.vel[b + 2];
       this.age[i] = this.age[last]; this.ttl[i] = this.ttl[last];
+      this.baseSize[i] = this.baseSize[last];
       this.aSize[i] = this.aSize[last]; this.aAge[i] = this.aAge[last];
       this.aRot[i] = this.aRot[last]; this.aAlpha[i] = this.aAlpha[last];
       this.spin[i] = this.spin[last];
@@ -491,10 +539,11 @@ export class ParticleField {
     this.vel[p3 + 2] = (r() - 0.5) * depth * 0.25;
     this.age[i] = 0;
     this.ttl[i] = Math.max(0.05, s.life * (1 - s.lifeJitter * 0.5 + r() * s.lifeJitter));
-    this.aSize[i] = Math.max(0.4, s.size * (1 - s.sizeJitter * 0.5 + r() * s.sizeJitter));
+    this.baseSize[i] = Math.max(0, s.size * (1 - s.sizeJitter * 0.5 + r() * s.sizeJitter));
+    this.aSize[i] = this.baseSize[i] * sampleParticleCurve(s.sizeOverLife, 0);
     this.aAge[i] = 0;
     this.aRot[i] = r() * TAU;
-    this.aAlpha[i] = 0;
+    this.aAlpha[i] = sampleParticleCurve(s.opacityOverLife, 0);
     this.spin[i] = (r() * 2 - 1) * s.spin;
   }
 

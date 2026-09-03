@@ -13,17 +13,17 @@ import * as THREE from 'three';
 import * as opentype from 'opentype.js';
 
 export const FONT_PRESETS = [
-  { id: 'noto-tc-700', label: 'Noto Sans TC · Bold（中文）', cjk: true,
+  { id: 'noto-tc-700', family: 'Noto Sans TC', weight: 700, label: 'Noto Sans TC · Bold（中文）', cjk: true,
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-tc@5.0.20/files/noto-sans-tc-chinese-traditional-700-normal.woff' },
-  { id: 'noto-tc-400', label: 'Noto Sans TC · Regular（中文）', cjk: true,
+  { id: 'noto-tc-400', family: 'Noto Sans TC', weight: 400, label: 'Noto Sans TC · Regular（中文）', cjk: true,
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-tc@5.0.20/files/noto-sans-tc-chinese-traditional-400-normal.woff' },
-  { id: 'inter-700', label: 'Inter · Bold',
+  { id: 'inter-700', family: 'Inter', weight: 700, label: 'Inter · Bold',
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/inter@5.0.20/files/inter-latin-700-normal.woff' },
-  { id: 'inter-400', label: 'Inter · Regular',
+  { id: 'inter-400', family: 'Inter', weight: 400, label: 'Inter · Regular',
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/inter@5.0.20/files/inter-latin-400-normal.woff' },
-  { id: 'bebas', label: 'Bebas Neue',
+  { id: 'bebas', family: 'Bebas Neue', weight: 400, label: 'Bebas Neue',
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/bebas-neue@5.0.20/files/bebas-neue-latin-400-normal.woff' },
-  { id: 'playfair-700', label: 'Playfair Display · Bold',
+  { id: 'playfair-700', family: 'Playfair Display', weight: 700, label: 'Playfair Display · Bold',
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/playfair-display@5.0.20/files/playfair-display-latin-700-normal.woff' }
 ];
 
@@ -41,21 +41,39 @@ export function orderFonts(slots, lead = 0) {
 
 let fontSerial = 0;
 
-export async function parseFont(arrayBuffer, name = 'font') {
+export async function parseFont(arrayBuffer, name = 'font', meta = {}) {
   const font = opentype.parse(arrayBuffer);
   font.__id = `f${++fontSerial}`;
   font.__label = font.names?.fullName?.en || font.names?.fontFamily?.en || name;
+  font.__familyName = meta.family || font.names?.fontFamily?.en || font.__label || name;
+  font.__weight = Number.isFinite(Number(meta.weight))
+    ? Number(meta.weight) : fontWeight(font);
   await registerFace(font, arrayBuffer);
   return font;
 }
 
-export async function loadFontFromUrl(url, name) {
+export async function loadFontFromUrl(url, name, meta = {}) {
   const res = await fetch(url, { mode: 'cors' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return parseFont(await res.arrayBuffer(), name);
+  return parseFont(await res.arrayBuffer(), name, meta);
 }
 
 export const loadFontFromFile = async file => parseFont(await file.arrayBuffer(), file.name);
+
+/** Best-effort weight metadata for uploaded OpenType / TrueType files. */
+function fontWeight(font) {
+  const tableWeight = Number(font.tables?.os2?.usWeightClass);
+  if (Number.isFinite(tableWeight) && tableWeight > 0) return tableWeight;
+  const name = String(font.names?.subfamily?.en || font.names?.fullName?.en || '').toLowerCase();
+  const matches = [
+    ['thin', 100], ['hairline', 100], ['extra light', 200], ['extralight', 200],
+    ['ultra light', 200], ['light', 300], ['book', 400], ['regular', 400],
+    ['normal', 400], ['medium', 500], ['semi bold', 600], ['semibold', 600],
+    ['demi', 600], ['bold', 700], ['extra bold', 800], ['extrabold', 800],
+    ['ultra bold', 800], ['black', 900], ['heavy', 900]
+  ];
+  return matches.find(([label]) => name.includes(label))?.[1] ?? 400;
+}
 
 // ── kerning ──────────────────────────────────────────────────
 //

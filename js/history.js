@@ -81,7 +81,7 @@ function describe(prev, next) {
   }
   // Most specific first: changing the duration rescales the layers too, and
   // "duration" is the honest name for that entry.
-  for (const evt of ['duration', 'project', 'camera', 'guides', 'particleMove', 'particles', 'clips', 'clip']) {
+  for (const evt of ['duration', 'project', 'camera', 'backdrop', 'guides', 'particleMove', 'particles', 'clips', 'clip']) {
     if (pending.has(evt)) return EVENT_LABELS[evt];
   }
   return 'edit';
@@ -105,11 +105,18 @@ const announce = () => emit('history', historyInfo());
 export function validSelection(sel) {
   const p = state.project;
   if (!sel || typeof sel !== 'object') return null;
-  if (sel.type === 'camera') return sel;
+  if (sel.type === 'camera' || sel.type === 'particles') return sel;
   if (sel.type === 'clip') {
     if (!p.clips.some(c => c.id === sel.id)) return null;
     const ids = (sel.ids ?? [sel.id]).filter(id => p.clips.some(c => c.id === id));
-    return { ...sel, ids: ids.length ? ids : [sel.id] };
+    const clip = p.clips.find(c => c.id === sel.id);
+    const hasColorKey = sel.colorKeyId && clip?.colorKeys?.some(key => key.id === sel.colorKeyId);
+    const { colorKeyId, ...rest } = sel;
+    return {
+      ...rest,
+      ids: ids.length ? ids : [sel.id],
+      ...(hasColorKey ? { colorKeyId } : {})
+    };
   }
   if (sel.type === 'particle') {
     return (p.particles?.emitters ?? []).some(e => e.id === sel.id) ? sel : null;

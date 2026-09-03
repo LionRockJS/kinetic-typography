@@ -149,8 +149,9 @@ tailwind.config = {
             Double-click an empty spot on a track to drop a layer there; drag its edges to trim,
             drag it up or down to change track. ⌘/Ctrl-click a layer to add it to the selection and
             ⇧-click to extend the run — on the timeline or in this list — then dragging any one
-            of them moves them all, on the timeline and on stage. Copy/paste keeps the layer's camera-relative position and pastes it at the
-            current playhead.
+            of them moves them all, on the timeline and on stage. A layer can follow a parent
+            layer from its inspector; its position then becomes a local offset. Copy/paste keeps
+            the layer's camera-relative position and pastes it at the current playhead.
           </p>
         </div>
       </section>
@@ -385,6 +386,8 @@ tailwind.config = {
           <div class="grid grid-cols-2 gap-1.5">
             <button id="btnAddEmitter" class="btn">Add emitter</button>
             <button id="btnDupEmitter" class="btn">Duplicate</button>
+            <button id="btnCopyEmitter" class="btn" title="Copy the selected emitter (⌘/Ctrl+C)">Copy</button>
+            <button id="btnPasteEmitter" class="btn" title="Paste a copied emitter at the playhead (⌘/Ctrl+V)">Paste</button>
           </div>
           <div id="emitterList" class="space-y-1"></div>
           <p id="particleHint" class="text-[10px] leading-relaxed text-zinc-600">

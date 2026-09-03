@@ -1,6 +1,7 @@
 // Project store + a tiny event bus.
 //
-// The project keeps independent structure, text, camera and backdrop media:
+// The project keeps independent structure, text, camera, backdrop colour and
+// backdrop media:
 //   levels — the 起承轉合 reference lines, at two scales: the overall arc of the
 //            whole video, and the finer animation arc inside it. Structure only,
 //            no content.
@@ -17,7 +18,7 @@ import { cameraAt, sortKeys, sortChannelKeys, defaultCameraPosition, cameraPosit
          normalizeCameraKey, normalizeCameraChannelKey,
          CAMERA_AXES, EASES, isSplitCamera } from './camera.js';
 import { EFFECTS, STAGE_KEYS, defaultStages, clipLive,
-         TEXT_STYLE, TEXT_STYLE_KEYS, stageStyle, overridesStyle } from './effects.js';
+         TEXT_STYLE, TEXT_STYLE_KEYS, stageStyle, clipStyle, overridesStyle } from './effects.js';
 import { clamp, uid } from './util.js';
 
 const listeners = new Map();
@@ -59,6 +60,21 @@ export const BACKDROP_MODES = Object.freeze([
   { id: 'four-point', label: '4-point gradient' }
 ]);
 
+const BACKDROP_MODE_ALIASES = Object.freeze({ circular: 'radial', 'circular-gradient': 'radial' });
+
+function canonicalBackdropMode(value) {
+  return BACKDROP_MODE_ALIASES[String(value ?? '').toLowerCase()] ?? value;
+}
+
+function backdropMode(value) {
+  const id = canonicalBackdropMode(value);
+  return BACKDROP_MODES.some(item => item.id === id) ? id : 'solid';
+}
+
+function isBackdropMode(value) {
+  return BACKDROP_MODES.some(item => item.id === canonicalBackdropMode(value));
+}
+
 const BACKDROP_DEFAULT = '#08090c';
 const BACKDROP_FALLBACKS = Object.freeze([
   BACKDROP_DEFAULT, '#1b2333', '#26344a', '#101722'
@@ -96,7 +112,6 @@ function backdropValue(source = {}, fallback = BACKDROP_FALLBACKS) {
     },
     radius: clamp(finiteValue(source.radius, 0.75), 0.05, 2)
   };
-
 }
 
 function copyBackdropValue(value) {
@@ -121,7 +136,7 @@ function normalizeBackdropKey(source = {}, fallback = BACKDROP_FALLBACKS, durati
 /** Create the colour track used by a fresh project and by old `bg` projects. */
 export function makeBackdrop(props = {}) {
   const source = props && typeof props === 'object' ? props : {};
-  const mode = BACKDROP_MODES.some(item => item.id === source.mode) ? source.mode : 'solid';
+  const mode = backdropMode(source.mode);
   const value = backdropValue(source, [hexColor(source.bg ?? source.color, BACKDROP_DEFAULT), ...BACKDROP_FALLBACKS.slice(1)]);
   const rawKeys = Array.isArray(source.keys) ? source.keys
     : Array.isArray(source.keyframes) ? source.keyframes : [];
@@ -135,13 +150,14 @@ export function makeBackdrop(props = {}) {
 /** Normalize a saved track in place, including projects written before it existed. */
 export function normalizeBackdrop(source, duration = 900, fallbackBg = BACKDROP_DEFAULT) {
   const fallback = [hexColor(fallbackBg), ...BACKDROP_FALLBACKS.slice(1)];
+  const trackDuration = Math.max(1, finiteValue(duration, 900));
   const next = makeBackdrop(source && typeof source === 'object'
     ? { ...source, bg: source.bg ?? fallback[0] }
     : { bg: fallback[0] });
   next.keys = (Array.isArray(source?.keys) ? source.keys
     : Array.isArray(source?.keyframes) ? source.keyframes : [])
     .filter(key => key && typeof key === 'object')
-    .map(key => normalizeBackdropKey(key, next.colors, Math.max(1, duration)));
+    .map(key => normalizeBackdropKey(key, next.colors, trackDuration));
   next.keys.sort((a, b) => a.t - b.t);
   return next;
 }
@@ -252,7 +268,7 @@ export const state = {
   project: freshProject(),
   ui: {
     time: 0, playing: false, loop: false,
-    sel: null,                    // {type:'clip',id} | {type:'guide',level,id,ids} | {type:'camkey',id} | {type:'camera'}
+    sel: null,                    // {type:'clip',id} | {type:'guide',level,id,ids} | {type:'camkey',id} | {type:'camera'} | {type:'backdrop'} | {type:'backdropkey',id} | {type:'particle',id} | {type:'particles'}
     snap: true, snapGuides: true, snapPeaks: true, snapWords: true, safeArea: false,
     viewMode: 'output',           // 'output' = final camera, 'space' = 3D scene editor
     particle: null,               // id of the particle emitter being edited
@@ -292,11 +308,76 @@ export const fontStack = () => state.fonts.map(f => f?.font).filter(Boolean);
 export const fontSlots = () => state.fonts.map(f => f?.font ?? null);
 export const fontsReady = () => fontStack().length > 0;
 
+// Stage slots are the fallback stack; the library keeps every decoded face
+// available for a layer override even after its stage slot is changed or
+// cleared. Font binaries are runtime-only, so only a layer's family/weight
+// choice is written into the project file.
+const fontLibrary = new Map();
+
+function normalizeFontEntry(entry) {
+  if (!entry?.font) return null;
+  const id = String(entry.id ?? entry.preset ?? entry.font.__id ?? '').trim();
+  if (!id) return null;
+  const family = String(entry.family ?? entry.font.__familyName ?? entry.name ?? id).trim() || id;
+  const weight = clamp(Math.round(finiteValue(entry.weight ?? entry.font.__weight, 400)), 1, 1000);
+  return { ...entry, id, family, weight };
+}
+
+export function registerFontAsset(entry) {
+  const normalized = normalizeFontEntry(entry);
+  if (!normalized) return null;
+  fontLibrary.set(normalized.id, normalized);
+  return normalized;
+}
+
+export const fontAssets = () => [...fontLibrary.values()];
+
+/** Find the decoded face requested by a layer, if it is available locally. */
+export function clipFont(clip) {
+  const family = String(clip?.fontFamily ?? '').trim();
+  if (!family) return null;
+  const weight = Number(clip?.fontWeight);
+  const wantedWeight = Number.isFinite(weight) ? weight : 400;
+  const sameFamily = entry => entry.family === family || entry.id === family || entry.preset === family;
+  const candidates = fontAssets().filter(sameFamily);
+  return (candidates.find(entry => entry.weight === wantedWeight) ?? candidates[0])?.font ?? null;
+}
+
 export function setFont(slot, entry) {
   if (slot < 0 || slot >= FONT_SLOTS) return;
   state.fonts[slot] = entry;
+  if (entry) registerFontAsset(entry);
   emit('fonts', state.fonts);
   emit('render');
+}
+
+/** Set a layer-local face/weight or return it to the stage fallback stack. */
+export function setClipFont(id, props = {}) {
+  const clip = clips().find(x => x.id === id);
+  if (!clip) return null;
+  if ('family' in props) {
+    const family = String(props.family ?? '').trim();
+    if (family) clip.fontFamily = family;
+    else delete clip.fontFamily;
+  }
+  if ('weight' in props) {
+    const weight = Number(props.weight);
+    if (Number.isFinite(weight)) clip.fontWeight = clamp(Math.round(weight), 1, 1000);
+    else delete clip.fontWeight;
+  }
+  if ('stageSlot' in props) {
+    if (props.stageSlot === null || props.stageSlot === undefined || props.stageSlot === '') {
+      delete clip.font;
+    } else {
+      const slot = Number(props.stageSlot);
+      if (Number.isFinite(slot)) clip.font = clamp(Math.trunc(slot), 0, FONT_SLOTS - 1);
+      else delete clip.font;
+    }
+  }
+  if (!clip.fontFamily) delete clip.fontWeight;
+  emit('clip', clip);
+  emit('render');
+  return clip;
 }
 
 export function makeClip(start, end, track, role, text = 'Text') {
@@ -307,9 +388,18 @@ export function makeClip(start, end, track, role, text = 'Text') {
     stages: defaultStages(defaultEffect(role), end - start),
     // Typeface, colour, size, line height, letter spacing and alignment are
     // absent on purpose: absent means "from the stage text style".
+    // A layer-local fontFamily/fontWeight pair is also absent until chosen;
+    // then the selected decoded face leads, with the stage stack as fallback.
+    // Colour keyframes are local to this layer, so moving the block keeps its
+    // colour changes attached to the same moments inside it.
+    colorKeys: [],
     // A locked layer keeps its own timing when the composition is rescaled,
     // and cannot be dragged or trimmed on the timeline.
     locked: false,
+    // A child stores its position as an offset from its parent. Roots keep a
+    // world-space position, so old projects and unparented layers retain the
+    // same coordinates.
+    parentId: null,
     position: { x: 0, y: 0, z: 0 },
     beatReact: role === 'zhuan' ? 0.6 : 0.25
   };
@@ -625,7 +715,7 @@ function interpolateBackdropValue(a, b, t) {
 export function backdropAt(source, t = 0) {
   const track = source?.backdrop && typeof source.backdrop === 'object'
     ? source.backdrop : (source ?? {});
-  const mode = BACKDROP_MODES.some(item => item.id === track.mode) ? track.mode : 'solid';
+  const mode = backdropMode(track.mode);
   const base = backdropValue(track);
   const keys = Array.isArray(track.keys) ? track.keys : [];
   if (!keys.length) return { mode, ...base };
@@ -649,7 +739,7 @@ export function sampleBackdrop(value, x = 0.5, y = 0.5) {
   const source = value && typeof value === 'object' ? value : {};
   const v = backdropValue(source);
   const px = clamp(Number(x) || 0, 0, 1), py = clamp(Number(y) || 0, 0, 1);
-  const mode = source.mode;
+  const mode = backdropMode(source.mode);
   let amount = 0.5;
   if (mode === 'linear') {
     const angle = v.angle * Math.PI / 180;
@@ -670,12 +760,13 @@ export function sampleBackdrop(value, x = 0.5, y = 0.5) {
 export function backdropCss(value) {
   const v = value && typeof value === 'object' ? value : {};
   const colors = backdropColorList(v);
-  if (v.mode === 'linear') return `linear-gradient(${v.angle ?? 0}deg, ${colors[0]}, ${colors[1]})`;
-  if (v.mode === 'radial') {
+  const mode = backdropMode(v.mode);
+  if (mode === 'linear') return `linear-gradient(${v.angle ?? 0}deg, ${colors[0]}, ${colors[1]})`;
+  if (mode === 'radial') {
     const center = v.center && typeof v.center === 'object' ? v.center : { x: 0.5, y: 0.5 };
     return `radial-gradient(circle at ${(center.x ?? 0.5) * 100}% ${(center.y ?? 0.5) * 100}%, ${colors[0]}, ${colors[1]})`;
   }
-  if (v.mode === 'four-point') {
+  if (mode === 'four-point') {
     return `radial-gradient(circle at 0 0, ${colors[0]}, transparent 68%),` +
       `radial-gradient(circle at 100% 0, ${colors[1]}, transparent 68%),` +
       `radial-gradient(circle at 0 100%, ${colors[2]}, transparent 68%),` +
@@ -690,7 +781,7 @@ export function setBackdrop(props = {}) {
   const center = props.center && typeof props.center === 'object'
     ? { ...b.center, ...props.center } : b.center;
   const next = backdropValue({ ...b, ...props, center }, b.colors);
-  if (BACKDROP_MODES.some(item => item.id === props.mode)) b.mode = props.mode;
+  if (isBackdropMode(props.mode)) b.mode = backdropMode(props.mode);
   Object.assign(b, next);
   // Keep the old static field useful to older integrations and project files.
   state.project.bg = b.colors[0];
@@ -789,6 +880,54 @@ export const selectedEmitter = () =>
  */
 export const activeEmitterId = () =>
   state.ui.sel?.type === 'particle' ? state.ui.sel.id : null;
+
+export const EMITTER_CLIPBOARD_FORMAT = 'kinetic-typography-emitter';
+
+/** Return a JSON-safe clipboard payload for one particle emitter. */
+export function copyEmitterData(id) {
+  const emitter = particleEmitter(id);
+  if (!emitter) return null;
+  return {
+    format: EMITTER_CLIPBOARD_FORMAT,
+    version: 1,
+    emitter: JSON.parse(JSON.stringify(emitter))
+  };
+}
+
+/** Paste a copied emitter at the playhead, preserving its live-window length. */
+export function pasteEmitter(data, t = state.ui.time) {
+  if (!data || typeof data !== 'object' || particleEmitters().length >= MAX_EMITTERS) return null;
+  if (data.format && data.format !== EMITTER_CLIPBOARD_FORMAT) return null;
+  const source = data.format
+    ? data.emitter
+    : (data.emitter && typeof data.emitter === 'object' ? data.emitter : data);
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
+
+  const duration = state.project.duration;
+  const at = Number.isFinite(Number(t)) ? Number(t) : state.ui.time;
+  const start = clamp(at, 0, Math.max(0, duration - 0.05));
+  const sourceStart = Number(source.start);
+  const sourceEnd = Number(source.end);
+  const length = Number.isFinite(sourceStart) && Number.isFinite(sourceEnd)
+    ? Math.max(0.05, sourceEnd - sourceStart) : 4;
+  const end = Math.min(duration, start + length);
+  const props = {
+    ...JSON.parse(JSON.stringify(source)),
+    id: undefined,
+    name: `${source.name || 'Emitter'} copy`,
+    start,
+    end: Math.max(start + 0.05, end),
+    revision: 0
+  };
+  return addParticleEmitter(props);
+}
+
+/** Select the particle track itself when its lane is clicked outside an emitter. */
+export function selectParticleTrack() {
+  if (state.ui.sel?.type === 'particles') return;
+  state.ui.sel = { type: 'particles' };
+  emit('selection', state.ui.sel);
+}
 
 export function selectEmitter(id) {
   const same = state.ui.particle === id && state.ui.sel?.type === 'particle' && state.ui.sel.id === id;
@@ -927,6 +1066,101 @@ export function selectedClips() {
 export const clipsInOrder = () =>
   [...clips()].sort((a, b) => a.start - b.start || a.track - b.track);
 
+function clipRecord(clipOrId) {
+  return typeof clipOrId === 'string'
+    ? clips().find(c => c.id === clipOrId) ?? null
+    : clipOrId && typeof clipOrId === 'object' ? clipOrId : null;
+}
+
+function finiteClipPosition(position = {}) {
+  position = position && typeof position === 'object' ? position : {};
+  return {
+    x: Number.isFinite(Number(position.x)) ? Number(position.x) : 0,
+    y: Number.isFinite(Number(position.y)) ? Number(position.y) : 0,
+    z: Number.isFinite(Number(position.z)) ? Number(position.z) : 0
+  };
+}
+
+function addClipPositions(a, b) {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+function subtractClipPositions(a, b) {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+
+/** Resolve one layer's authored local offset into world-space coordinates. */
+export function clipWorldPosition(clipOrId, seen = new Set()) {
+  const clip = clipRecord(clipOrId);
+  if (!clip) return null;
+  const local = finiteClipPosition(clip.position);
+  const id = typeof clip.id === 'string' ? clip.id : '';
+  if (!clip.parentId || (id && seen.has(id))) return local;
+
+  const nextSeen = new Set(seen);
+  if (id) nextSeen.add(id);
+  const parent = clipRecord(clip.parentId);
+  // Malformed files should fail safe as a root instead of making a layer
+  // disappear or recursing forever.
+  if (!parent || parent.id === clip.id || nextSeen.has(parent.id)) return local;
+  const parentPosition = clipWorldPosition(parent, nextSeen);
+  return parentPosition ? addClipPositions(parentPosition, local) : local;
+}
+
+/** True when `id` is below `ancestorId` in the text-layer hierarchy. */
+export function isClipDescendant(id, ancestorId) {
+  if (!id || !ancestorId || id === ancestorId) return false;
+  let current = clipRecord(id);
+  const seen = new Set();
+  while (current?.parentId) {
+    if (seen.has(current.id)) return false;
+    seen.add(current.id);
+    if (current.parentId === ancestorId) return true;
+    current = clipRecord(current.parentId);
+  }
+  return false;
+}
+
+/** Whether a layer can safely be assigned the proposed parent. */
+export function canSetClipParent(id, parentId = null) {
+  const child = clipRecord(id);
+  if (!child) return false;
+  if (parentId === null || parentId === undefined || parentId === '') return true;
+  const parent = clipRecord(parentId);
+  return !!parent && parent.id !== child.id && !isClipDescendant(parent.id, child.id);
+}
+
+/**
+ * Change a layer's parent while preserving its current world position. Its
+ * stored position becomes the local offset needed to get back to that point.
+ */
+export function setClipParent(id, parentId = null) {
+  const clip = clipRecord(id);
+  const next = parentId === null || parentId === undefined || parentId === ''
+    ? null : String(parentId);
+  if (!clip || !canSetClipParent(id, next)) return null;
+
+  const world = clipWorldPosition(clip) ?? finiteClipPosition(clip.position);
+  clip.parentId = next;
+  const parentWorld = next ? clipWorldPosition(next) : null;
+  clip.position = parentWorld ? subtractClipPositions(world, parentWorld) : world;
+  emit('clip', clip);
+  emit('render');
+  return clip;
+}
+
+/** Set a layer's position from world space, converting to a child offset. */
+export function setClipWorldPosition(id, position) {
+  const clip = clipRecord(id);
+  if (!clip) return null;
+  const world = finiteClipPosition(position);
+  const parentWorld = clip.parentId ? clipWorldPosition(clip.parentId) : null;
+  clip.position = parentWorld ? subtractClipPositions(world, parentWorld) : world;
+  emit('clip', clip);
+  emit('render');
+  return clip;
+}
+
 /**
  * Select a text layer.
  *
@@ -1061,6 +1295,124 @@ export function selectGuidesInRange(levelKey, a, b) {
 }
 export const clipsAt = t => clips().filter(c => clipLive(c, t, state.project));
 
+/** The colour keys authored inside one text layer, in local seconds. */
+export const clipColorKeys = clipOrId => {
+  const clip = typeof clipOrId === 'string'
+    ? clips().find(c => c.id === clipOrId)
+    : clipOrId;
+  return Array.isArray(clip?.colorKeys) ? clip.colorKeys : [];
+};
+
+export const clipColorKey = (clipOrId, id) =>
+  clipColorKeys(clipOrId).find(key => key.id === id) ?? null;
+
+/** The colour key selected in the layer inspector, if any. */
+export const selectedClipColorKey = () => {
+  const sel = state.ui.sel;
+  return sel?.type === 'clip' && sel.colorKeyId
+    ? clipColorKey(sel.id, sel.colorKeyId)
+    : null;
+};
+
+/** Evaluate the colour a text layer should use at composition time. */
+export function clipColorAt(clip, project = state.project, time = state.ui.time) {
+  const base = hexColor(clipStyle(clip, project).color, '#ffffff');
+  const keys = clipColorKeys(clip)
+    .filter(key => key && Number.isFinite(Number(key.t)))
+    .slice()
+    .sort((a, b) => a.t - b.t);
+  if (!keys.length) return base;
+
+  const at = (Number.isFinite(Number(time)) ? Number(time) : 0) - (Number(clip?.start) || 0);
+  if (at < keys[0].t) return base;
+  if (at >= keys.at(-1).t) return hexColor(keys.at(-1).color, base);
+
+  let i = 0;
+  while (i < keys.length - 1 && keys[i + 1].t <= at) i++;
+  const a = keys[i], b = keys[i + 1];
+  const span = Math.max(1e-6, b.t - a.t);
+  const raw = clamp((at - a.t) / span, 0, 1);
+  const u = (EASES[a.ease] ?? EASES.smooth).fn(raw);
+  return mixHex(hexColor(a.color, base), hexColor(b.color, base), u);
+}
+
+function selectClipColorKeyState(clip, key) {
+  state.ui.sel = {
+    type: 'clip', id: clip.id, ids: [clip.id], anchor: clip.id, colorKeyId: key.id
+  };
+  emit('selection', state.ui.sel);
+}
+
+/** Select a colour key while keeping the layer as the active inspector target. */
+export function selectClipColorKey(clipId, keyId) {
+  const clip = clips().find(c => c.id === clipId);
+  const key = clipColorKey(clip, keyId);
+  if (!clip || !key) return null;
+  selectClipColorKeyState(clip, key);
+  return key;
+}
+
+/** Add or select a colour key at an absolute composition time. */
+export function addClipColorKey(clipId, time = state.ui.time) {
+  const clip = clips().find(c => c.id === clipId);
+  if (!clip) return null;
+  const len = Math.max(MIN_CLIP, clip.end - clip.start);
+  const at = clamp(Number.isFinite(Number(time)) ? Number(time) : state.ui.time,
+    clip.start, clip.end);
+  const local = clamp(at - clip.start, 0, len);
+  const existing = clipColorKeys(clip).find(key => Math.abs(key.t - local) < 1e-3);
+  if (existing) {
+    selectClipColorKeyState(clip, existing);
+    return existing;
+  }
+  const key = { id: uid('cck'), t: local, color: clipColorAt(clip, state.project, at), ease: 'smooth' };
+  clip.colorKeys.push(key);
+  clip.colorKeys.sort((a, b) => a.t - b.t);
+  selectClipColorKeyState(clip, key);
+  emit('clip', clip);
+  emit('render');
+  return key;
+}
+
+/** Change a colour key's local time, colour, or easing. */
+export function updateClipColorKey(clipId, keyId, props = {}) {
+  const clip = clips().find(c => c.id === clipId);
+  const key = clipColorKey(clip, keyId);
+  if (!clip || !key) return null;
+  const len = Math.max(MIN_CLIP, clip.end - clip.start);
+  if ('t' in props) {
+    const value = Number(props.t);
+    if (Number.isFinite(value)) key.t = clamp(value, 0, len);
+  }
+  if ('color' in props) key.color = hexColor(props.color, key.color);
+  if ('ease' in props) key.ease = EASES[props.ease] ? props.ease : 'smooth';
+  if ('t' in props) clip.colorKeys.sort((a, b) => a.t - b.t);
+  emit('clip', clip);
+  emit('render');
+  return key;
+}
+
+/** Remove one colour key and keep the layer selected. */
+export function removeClipColorKey(clipId, keyId) {
+  const clip = clips().find(c => c.id === clipId);
+  if (!clip) return null;
+  const keys = clipColorKeys(clip);
+  const i = keys.findIndex(key => key.id === keyId);
+  if (i < 0) return null;
+  const [removed] = keys.splice(i, 1);
+  if (state.ui.sel?.type === 'clip' && state.ui.sel.id === clipId && state.ui.sel.colorKeyId === keyId) {
+    const next = keys[Math.max(0, i - 1)] ?? keys[0];
+    state.ui.sel = {
+      type: 'clip', id: clip.id, ids: [clip.id], anchor: clip.id,
+      ...(next ? { colorKeyId: next.id } : {})
+    };
+    emit('selection', state.ui.sel);
+  }
+  emit('clip', clip);
+  emit('render');
+  return removed;
+}
+
 /**
  * The displacement of the authored camera from its neutral framing.
  *
@@ -1093,16 +1445,8 @@ export function copyClipData(id, t = state.ui.time) {
     format: CLIPBOARD_FORMAT,
     version: 1,
     clip: JSON.parse(JSON.stringify(clip)),
+    worldPosition: clipWorldPosition(clip),
     cameraOffset: cameraFrameOffsetAt(t)
-  };
-}
-
-function finiteClipPosition(position = {}) {
-  position = position && typeof position === 'object' ? position : {};
-  return {
-    x: Number.isFinite(Number(position.x)) ? Number(position.x) : 0,
-    y: Number.isFinite(Number(position.y)) ? Number(position.y) : 0,
-    z: Number.isFinite(Number(position.z)) ? Number(position.z) : 0
   };
 }
 
@@ -1130,27 +1474,36 @@ export function pasteClip(data, t = state.ui.time) {
   const end = clamp(start + length, start + MIN_CLIP, p.duration);
 
   const copiedOffset = finiteClipPosition(data.cameraOffset);
-  const sourcePosition = finiteClipPosition(source.position);
-  const localPosition = {
+  const sourcePosition = finiteClipPosition(data.worldPosition ?? clipWorldPosition(source) ?? source.position);
+  const worldPosition = {
     x: sourcePosition.x - copiedOffset.x,
     y: sourcePosition.y - copiedOffset.y,
     z: sourcePosition.z - copiedOffset.z
   };
   const currentOffset = cameraFrameOffsetAt(start);
+  const desiredWorld = {
+    x: worldPosition.x + currentOffset.x,
+    y: worldPosition.y + currentOffset.y,
+    z: worldPosition.z + currentOffset.z
+  };
+  const parentId = typeof source.parentId === 'string' && canSetClipParent(
+    source.id, source.parentId) && p.clips.some(c => c.id === source.parentId)
+    ? source.parentId : null;
   const clip = {
     ...JSON.parse(JSON.stringify(source)),
     id: uid('c'), start, end,
     track: clamp(Math.round(Number(source.track) || 0), 0, TRACKS - 1),
-    position: {
-      x: localPosition.x + currentOffset.x,
-      y: localPosition.y + currentOffset.y,
-      z: localPosition.z + currentOffset.z
-    }
+    parentId,
+    position: desiredWorld
   };
   delete clip.offsetX;
   delete clip.offsetY;
   normalizeStages(clip);
+  normalizeColorKeys(clip);
+  normalizeClipFont(clip);
   p.clips.push(clip);
+  const parentWorld = parentId ? clipWorldPosition(parentId) : null;
+  if (parentWorld) clip.position = subtractClipPositions(desiredWorld, parentWorld);
   state.ui.sel = { type: 'clip', id: clip.id, ids: [clip.id] };
   emit('clips', p.clips);
   emit('selection', state.ui.sel);
@@ -1523,6 +1876,7 @@ export function setDuration(d, { scale = true } = {}) {
         const stage = c.stages?.[key];
         if (stage) stage.dur = (Number(stage.dur) || 0) * k;
       }
+      for (const key of c.colorKeys ?? []) key.t *= k;
     });
     p.particles.emitters.forEach(e => { e.start *= k; e.end *= k; });
     const backdropTrack = p.backdrop;
@@ -1599,6 +1953,36 @@ function normalizeStages(c) {
   delete c.params;
 }
 
+/** Keep layer colour keys serialisable and inside the layer's local span. */
+function normalizeColorKeys(c) {
+  const len = Math.max(MIN_CLIP, c.end - c.start);
+  const fallback = hexColor(clipStyle(c, state.project).color, '#ffffff');
+  const raw = Array.isArray(c.colorKeys) ? c.colorKeys
+    : Array.isArray(c.colorKeyframes) ? c.colorKeyframes : [];
+  c.colorKeys = raw
+    .filter(key => key && typeof key === 'object')
+    .map(source => ({
+      id: typeof source.id === 'string' && source.id ? source.id : uid('cck'),
+      t: clamp(finiteValue(source.t, 0), 0, len),
+      color: hexColor(source.color, fallback),
+      ease: EASES[source.ease] ? source.ease : 'smooth'
+    }))
+    .sort((a, b) => a.t - b.t);
+  delete c.colorKeyframes;
+}
+
+/** Keep a layer-local face and weight as a small serialisable reference. */
+function normalizeClipFont(c) {
+  const family = String(c.fontFamily ?? c.fontFace ?? '').trim();
+  if (family) c.fontFamily = family;
+  else delete c.fontFamily;
+  delete c.fontFace;
+
+  const weight = Number(c.fontWeight);
+  if (family && Number.isFinite(weight)) c.fontWeight = clamp(Math.round(weight), 1, 1000);
+  else delete c.fontWeight;
+}
+
 /**
  * Change the stage text style. Every layer that has not overridden the fields
  * being set follows along, which is the point of it.
@@ -1615,20 +1999,33 @@ export function resetClipStyle(id, key = null) {
   const clip = clips().find(c => c.id === id);
   if (!clip) return;
   for (const k of key ? [key] : TEXT_STYLE_KEYS) delete clip[k];
+  if (!key || key === 'font') {
+    delete clip.fontFamily;
+    delete clip.fontWeight;
+  }
   emit('clip', clip);
   emit('render');
 }
 
 export function normalizeClips() {
   const d = state.project.duration;
+  // A terminal text layer may overhang the composition by one frame. This
+  // keeps the final rendered frame inside the layer instead of sampling its
+  // out-point exactly, where an exit effect can already be invisible.
+  const terminalFrame = 1 / Math.max(1, Number(state.project.fps) || 30);
   const width = Number(state.project.width) || 1080;
   const height = Number(state.project.height) || 1080;
+  const ids = new Set(state.project.clips.map(c => c.id));
   for (const c of state.project.clips) {
     c.start = clamp(c.start, 0, Math.max(0, d - MIN_CLIP));
-    c.end = clamp(c.end, c.start + MIN_CLIP, d);
+    c.end = clamp(c.end, c.start + MIN_CLIP, d + terminalFrame);
     c.track = clamp(Math.round(c.track), 0, TRACKS - 1);
     c.locked = c.locked === true;
     normalizeStages(c);
+    normalizeColorKeys(c);
+    normalizeClipFont(c);
+    c.parentId = typeof c.parentId === 'string' && c.parentId !== c.id && ids.has(c.parentId)
+      ? c.parentId : null;
     const pos = c.position;
     c.position = {
       x: Number.isFinite(Number(pos?.x)) ? Number(pos.x) : (Number(c.offsetX) || 0) * width,
@@ -1637,6 +2034,19 @@ export function normalizeClips() {
     };
     delete c.offsetX;
     delete c.offsetY;
+  }
+
+  // Break one edge of any malformed cycle deterministically. Normal authored
+  // hierarchies remain untouched, while an old or hand-edited project cannot
+  // make world-position resolution recurse forever.
+  for (const start of state.project.clips) {
+    const seen = new Set();
+    let current = start;
+    while (current?.parentId) {
+      if (seen.has(current.id)) { start.parentId = null; break; }
+      seen.add(current.id);
+      current = state.project.clips.find(c => c.id === current.parentId) ?? null;
+    }
   }
 }
 
@@ -1662,10 +2072,7 @@ export function addClip(start, end, track = 0) {
 export function alignClipWithCamera(id, t = state.ui.time) {
   const clip = clips().find(c => c.id === id);
   if (!clip) return null;
-  clip.position = cameraFrameOffsetAt(t);
-  emit('clip', clip);
-  emit('render');
-  return clip;
+  return setClipWorldPosition(id, cameraFrameOffsetAt(t));
 }
 
 export function duplicateClip(id) {
@@ -1673,6 +2080,7 @@ export function duplicateClip(id) {
   if (!src) return null;
   const len = src.end - src.start;
   const clip = { ...src, id: uid('c'), stages: copyStages(src.stages),
+                 colorKeys: copyColorKeys(src.colorKeys),
                  start: clamp(src.end, 0, state.project.duration - MIN_CLIP) };
   clip.position = { ...(src.position ?? { x: 0, y: 0, z: 0 }) };
   clip.end = clamp(clip.start + len, clip.start + MIN_CLIP, state.project.duration);
@@ -1688,6 +2096,14 @@ export function removeClip(id) {
   const p = state.project;
   const i = p.clips.findIndex(c => c.id === id);
   if (i < 0) return;
+  // Detach direct children at their current world positions before removing
+  // the parent, so deleting a layer never makes the rest of the hierarchy jump.
+  for (const child of p.clips) {
+    if (child.parentId !== id) continue;
+    const world = clipWorldPosition(child);
+    child.parentId = null;
+    child.position = world ?? finiteClipPosition(child.position);
+  }
   p.clips.splice(i, 1);
   const sel = state.ui.sel;
   if (sel?.type === 'clip') {
@@ -1715,6 +2131,9 @@ const copyStages = stages => Object.fromEntries(STAGE_KEYS.map(key => {
   const s = stages?.[key] ?? {};
   return [key, { ...s, params: { ...(s.params ?? {}) } }];
 }));
+
+const copyColorKeys = keys => (Array.isArray(keys) ? keys : [])
+  .map(key => ({ ...key }));
 
 /** Set the effect or the params of one stage of a text layer. */
 export function setClipStage(id, key, props) {
@@ -1943,7 +2362,7 @@ function restoreVideo(json, durationLimit) {
 
 // The on-disk contract, shared by Save, Open and the autosave snapshot.
 export const PROJECT_FORMAT = 'kinetic-typography-composer';
-export const PROJECT_VERSION = 11;
+export const PROJECT_VERSION = 13;
 
 export function serialize() {
   return {
