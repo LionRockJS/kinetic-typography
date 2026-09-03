@@ -43,6 +43,10 @@ tailwind.config = {
     .btn-sq     { @apply w-8 h-8 p-0; }
     .btn-ghost  { @apply bg-transparent border-transparent hover:bg-base-600; }
     .chip       { @apply px-1.5 py-0.5 rounded text-[10px] font-mono tabular-nums bg-base-600 text-zinc-400; }
+    /* the readout beside a slider — a field, so a value can be typed exactly */
+    .num        { @apply w-[4.5rem] shrink-0 bg-transparent border border-transparent rounded px-1 py-px text-right
+                        font-mono tabular-nums normal-case text-[10px] text-zinc-400 outline-none transition cursor-text
+                        hover:border-line hover:bg-base-900 focus:border-sky-500/70 focus:bg-base-900 focus:text-zinc-100; }
     .tog        { @apply flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none; }
   }
 </style>
@@ -88,9 +92,13 @@ tailwind.config = {
     <div class="flex-1"></div>
 
     <div class="flex items-center gap-1.5">
+      <button id="btnUndo" class="btn" title="Undo (⌘/Ctrl+Z)" disabled>Undo</button>
+      <button id="btnRedo" class="btn" title="Redo (⌘/Ctrl+⇧Z)" disabled>Redo</button>
+      <span class="w-px h-4 bg-line mx-0.5"></span>
+      <button id="btnNew" class="btn" title="Start a new composition (the current one is discarded)">New</button>
       <button id="btnSave" class="btn" title="Download project JSON">Save</button>
       <button id="btnLoad" class="btn" title="Open project JSON">Open</button>
-      <button id="btnRecord" class="btn" title="Record a WebM video in real time">
+      <button id="btnRecord" class="btn" title="Record a video in real time (MP4 where supported, else WebM)">
         <span class="w-2 h-2 rounded-full bg-red-500"></span> Record
       </button>
     </div>
@@ -139,8 +147,10 @@ tailwind.config = {
           <div id="clipList" class="space-y-1"></div>
           <p class="text-[10px] leading-relaxed text-zinc-600">
             Double-click an empty spot on a track to drop a layer there; drag its edges to trim,
-            drag it up or down to change track. Copy/paste keeps the layer's camera-relative
-            position and pastes it at the current playhead.
+            drag it up or down to change track. ⌘/Ctrl-click a layer to add it to the selection and
+            ⇧-click to extend the run — on the timeline or in this list — then dragging any one
+            of them moves them all, on the timeline and on stage. Copy/paste keeps the layer's camera-relative position and pastes it at the
+            current playhead.
           </p>
         </div>
       </section>
@@ -310,6 +320,18 @@ tailwind.config = {
         <div id="stageFrame" class="relative shadow-[0_0_0_1px_rgba(255,255,255,0.07),0_24px_60px_-12px_rgba(0,0,0,0.9)] rounded-sm overflow-hidden">
           <canvas id="stageCanvas" class="block"></canvas>
           <div id="safeArea" class="hidden absolute inset-[5%] border border-dashed border-white/15 pointer-events-none"></div>
+          <!-- move control for the selected text layer, drawn over the output -->
+          <svg id="stageGizmo" class="hidden absolute inset-0 w-full h-full pointer-events-none">
+            <polygon id="gzBox" class="gz-box" points=""></polygon>
+            <circle id="gzC0" class="gz-corner" r="3"></circle>
+            <circle id="gzC1" class="gz-corner" r="3"></circle>
+            <circle id="gzC2" class="gz-corner" r="3"></circle>
+            <circle id="gzC3" class="gz-corner" r="3"></circle>
+            <circle id="gzHandle" class="gz-handle" r="9"></circle>
+            <line id="gzCrossH" class="gz-cross"></line>
+            <line id="gzCrossV" class="gz-cross"></line>
+          </svg>
+          <div id="gzReadout" class="hidden absolute px-1.5 py-0.5 rounded bg-black/75 border border-white/10 text-[10px] font-mono text-zinc-200 whitespace-pre pointer-events-none"></div>
         </div>
         <div class="absolute top-3 left-3 flex items-center gap-2 pointer-events-none">
           <span id="vpDim" class="chip !bg-black/50 backdrop-blur"></span>
@@ -337,7 +359,7 @@ tailwind.config = {
         <div id="inspector" class="panel-bd"></div>
       </section>
 
-      <section class="panel">
+      <section id="camPanel" class="panel hidden">
         <div class="panel-hd">
           <span>Camera</span>
           <span id="camChip" class="chip">no keys</span>
@@ -365,29 +387,33 @@ tailwind.config = {
             <button id="btnDupEmitter" class="btn">Duplicate</button>
           </div>
           <div id="emitterList" class="space-y-1"></div>
-          <div id="particlePanel" class="space-y-2.5"></div>
+          <p id="particleHint" class="text-[10px] leading-relaxed text-zinc-600">
+            Select an emitter — here or on its timeline track — to edit its settings.
+          </p>
+          <div id="particlePanel" class="space-y-2.5 hidden"></div>
         </div>
       </section>
 
       <section class="panel">
         <div class="panel-hd"><span>Look</span></div>
         <div class="panel-bd">
-          <div class="grid grid-cols-2 gap-2">
-            <div>
-              <span class="lbl">Background</span>
-              <input id="bgColor" type="color" class="w-full h-8 bg-base-900 border border-line rounded cursor-pointer">
-            </div>
-            <div>
-              <span class="lbl">Vignette <span id="vigVal" class="text-zinc-400 font-mono normal-case"></span></span>
-              <input id="vignette" type="range" min="0" max="1" step="0.01" class="w-full mt-2">
-            </div>
+          <!-- the stage text style every layer inherits, built in ui.js -->
+          <div id="stageText" class="space-y-2.5 pb-3 border-b border-line/70"></div>
+          <div id="backdropEditor" class="space-y-2.5 pb-3 border-b border-line/70"></div>
+          <div>
+            <span class="lbl flex items-center justify-between gap-1">Vignette
+              <input id="vignetteVal" type="number" class="num !w-12" spellcheck="false"></span>
+            <input id="vignette" type="range" min="0" max="1" step="0.01" class="w-full mt-2">
           </div>
           <div>
-            <span class="lbl">Grain <span id="grainVal" class="text-zinc-400 font-mono normal-case"></span></span>
+            <span class="lbl flex items-center justify-between gap-2">Grain
+              <input id="grainVal" type="number" class="num" spellcheck="false"></span>
             <input id="grain" type="range" min="0" max="0.5" step="0.005" class="w-full">
           </div>
           <div>
-            <span class="lbl">Depth of glyphs <span id="depthVal" class="text-zinc-400 font-mono normal-case"></span></span>
+            <span class="lbl flex items-center justify-between gap-2">
+              <span class="min-w-0 truncate">Depth of glyphs <span class="text-zinc-700 normal-case">(px)</span></span>
+              <input id="depthVal" type="number" class="num" spellcheck="false"></span>
             <input id="depth" type="range" min="0" max="60" step="1" class="w-full">
           </div>
         </div>

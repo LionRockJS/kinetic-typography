@@ -1,16 +1,23 @@
 // Panel wiring. Everything here reads and writes the store; nothing else touches the DOM.
 
-import { state, level, guides, clips, selectedClip, selectedGuide, selectedGuideIds,
+import { state, level, guides, clips, selectedClip, selectedClips, selectedClipIds,
+         selectClip, clipsInOrder, selectedGuide, selectedGuideIds,
          selectedGuideIndices, select, selectGuide, on, emit, patch,
-         setRepeats, setDuration, updateClip, commitGuides, addClip, reframe,
-         duplicateClip, removeClip, serialize, deserialize, track, audioClips, anyAudio,
+         setRepeats, setDuration, updateClip, setTextStyle, resetClipStyle,
+         commitGuides, addClip, reframe,
+         duplicateClip, removeClip, serialize, deserialize, track, audioClips, savedAudioClips, anyAudio,
          setTrackStart, setTrackLevel, setAudioClipStart, setAudioClipLevel,
          setHitParams, syncBeatTimes,
          beatTimes, barTimes, setMetro, hasGrid, setRunPivot, runPivotIndex,
          videoClips, videoClip,
          setVideoClipStart, setVideoClipSettings,
-         particleEmitters, selectedEmitter, selectEmitter, updateEmitter,
+         BACKDROP_MODES, backdrop, backdropAt, backdropKeys, selectedBackdropKey,
+         selectBackdropKey, selectBackdropTrack, addBackdropKey, updateBackdropKey,
+         setBackdrop, removeBackdropKey, clearBackdropTrack, backdropCss,
+         setClipStage, setStageDuration,
+         particleEmitters, selectedEmitter, selectEmitter, activeEmitterId, updateEmitter,
          addParticleEmitter, duplicateParticleEmitter, removeParticleEmitter,
+         alignEmitterWithCamera,
          camera, cameraKeys, cameraMode, cameraChannelKeys, cameraKeyCount,
          selectedCamKey, selectedCamAxis,
          addCameraKey, addCameraChannelKey, setCameraChannelSpan,
@@ -19,8 +26,10 @@ import { state, level, guides, clips, selectedClip, selectedGuide, selectedGuide
          selectCameraKey,
          alignClipWithCamera,
          copyClipData, pasteClip, CLIPBOARD_FORMAT,
+         newProject, PROJECT_FORMAT, PROJECT_VERSION,
          FONT_SLOTS, DIM_PRESETS,
          TRACKS, MIN_CLIP } from './state.js';
+import { undo, redo, resetHistory, touch, historyInfo } from './history.js';
 import { VOICES } from './audio/metronome.js';
 import { EASES, cameraAt, defaultCameraPosition } from './camera.js';
 import { TRACK_KINDS } from './audio/engine.js';
@@ -28,15 +37,17 @@ import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
 import { PARTICLE_SHAPES, PARTICLE_ORIGINS, TEXT_MODES, MAX_EMITTERS } from './particles.js';
 import { ROLES, LEVELS, LEVEL_KEYS, patternLabel, rebalanceGuides, guideDisplay, guideHandles,
          regionAt, drivingRegion, normalizeGuides, scaleRange, distributeRange, DISTRIBUTIONS } from './structure.js';
-import { EFFECTS, effectsForRole, effectIds, resolveParams } from './effects.js';
+import { EFFECTS, effectsForRole, effectIds, resolveParams,
+         clipStage, stageWindows, clipLive, clipStyle, stageStyle, overridesStyle,
+         TEXT_STYLE_KEYS, STAGE_KEYS } from './effects.js';
 import { FONT_PRESETS } from './typography.js';
 import { $, el, fmtTime, fmtDur, clamp, download, toast, nearest, round } from './util.js';
+import { clearAutosave } from './autosave.js';
+import { requestMedia } from './media/store.js';
+import { pickAudioFiles, pickVideoFiles } from './media/pick.js';
 
 let app;
 let clipClipboard = null;
-
-const PROJECT_FORMAT = 'kinetic-typography-composer';
-const PROJECT_VERSION = 8;
 
 function parseProjectFile(text) {
   // JSON exported by some desktop/browser combinations can start with a UTF-8
@@ -70,25 +81,32 @@ export function initUI(ctx) {
   buildShortcuts();
 
   on('project duration', syncTopBar);
+  on('history', syncHistoryButtons);
   on('guides duration', () => { renderPattern(); syncInspector(); });
   on('clips duration', () => { renderClipList(); syncInspector(); });
-  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); });
+  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); renderParticlePanel(); renderBackdropPanel(); });
   on('camera', renderCameraPanel);
-  on('clip', () => { renderClipList(); });
+  on('clip', () => { renderClipList(); syncInspector(); });
   on('audio audioMove audioLevel hits', syncAudioPanel);
   on('video videoMove videoLevel', syncVideoPanel);
+  on('backdrop', renderBackdropPanel);
   on('particles project duration', renderParticlePanel);
+  on('particleMove', renderEmitterList);   // a timeline drag only moves the window
   on('metro grid audio', syncMetroPanel);
-  on('fonts', syncFontPanel);
+  on('fonts', () => { syncFontPanel(); renderStageText(); });
+  // The stage style also decides what an inherited field in the inspector shows.
+  on('project', () => { renderStageText(); syncInspector(); });
   on('view', syncViewMode);
   on('time clips clip guides audioMove', syncTime);
 
   syncTopBar();
+  syncHistoryButtons();
   renderPattern();
   renderClipList();
   renderVideoChannels();
   buildInspector();
   renderCameraPanel();
+  renderStageText();
   syncAudioPanel();
   syncMetroPanel();
   syncFontPanel();
@@ -107,7 +125,7 @@ function buildTopBar() {
     syncTopBar();
   });
 
-  $('#projName').addEventListener('input', e => { state.project.name = e.target.value; });
+  $('#projName').addEventListener('input', e => { state.project.name = e.target.value; touch('project'); });
 
   const dim = () => {
     patch({
@@ -125,13 +143,29 @@ function buildTopBar() {
   });
   $('#fpsInput').addEventListener('change', e => patch({ fps: clamp(+e.target.value || 30, 1, 120) }));
 
+  $('#btnUndo').addEventListener('click', () => undo());
+  $('#btnRedo').addEventListener('click', () => redo());
+
+  $('#btnNew').addEventListener('click', () => {
+    // Destructive and not undoable — the composition it replaces is gone from
+    // the autosave too, so this one asks first.
+    if (!confirm('Start a new composition? Anything unsaved in this one is discarded.')) return;
+    for (const { kind } of TRACK_KINDS) app.clearAudio?.(kind);
+    app.clearVideos?.();
+    newProject();
+    resetHistory('new composition');
+    clearAutosave();   // nothing to recover until this one is edited
+    app.timeline.fit();
+    toast('New composition');
+  });
+
   $('#btnSave').addEventListener('click', () => {
     const name = (state.project.name || 'composition').replace(/[^\w\-. ]+/g, '_');
     download(`${name}.ktc.json`, new Blob([JSON.stringify(serialize(), null, 2)], { type: 'application/json' }));
     toast('Project saved');
   });
   $('#btnLoad').addEventListener('click', () => $('#projFile').click());
-  const openProject = projectFile => {
+  const openProject = async projectFile => {
     if (!projectFile || projectFile.format !== PROJECT_FORMAT) throw new Error('Not a composer file');
     // The project file stores media references, not browser-owned buffers.
     // Drop the current runtime sources before replacing their metadata so
@@ -139,15 +173,23 @@ function buildTopBar() {
     for (const { kind } of TRACK_KINDS) app.clearAudio?.(kind);
     app.clearVideos?.();
     deserialize(projectFile);
+    resetHistory('open project');
     app.timeline.fit();
-    toast('Project loaded — re-import saved audio and backdrop media to attach them');
+    // Sources imported on this browser are cached locally, so most projects come
+    // back whole; only what the cache has lost still needs the user.
+    const { pending = 0, attached = 0, needsPermission = 0 } = await app.relinkSavedMedia?.() ?? {};
+    if (!pending) toast('Project loaded');
+    else if (attached === pending) toast(`Project loaded — ${attached} media file${attached === 1 ? '' : 's'} reattached`);
+    else if (needsPermission) toast(`Project loaded — ${attached ? `${attached} reattached, ` : ''}${needsPermission} saved ${needsPermission === 1 ? 'file needs' : 'files need'} permission: click ↗`);
+    else if (attached) toast(`Project loaded — ${attached} of ${pending} media files reattached; re-import the rest`);
+    else toast('Project loaded — re-import saved audio and backdrop media to attach them');
   };
 
   $('#projFile').addEventListener('change', async e => {
     const f = e.target.files?.[0];
     if (!f) return;
     try {
-      openProject(parseProjectFile(await f.text()));
+      await openProject(parseProjectFile(await f.text()));
     } catch (err) {
       console.error('Could not open project file', err);
       toast('Could not read that file');
@@ -168,6 +210,15 @@ function syncTopBar() {
   $('#dimPreset').value = idx >= 0 ? String(idx) : 'custom';
   $('#vpDim').textContent = `${p.width} × ${p.height}`;
   $('#timeTotal').textContent = fmtTime(p.duration);
+}
+
+function syncHistoryButtons() {
+  const h = historyInfo();
+  const undoBtn = $('#btnUndo'), redoBtn = $('#btnRedo');
+  undoBtn.disabled = !h.canUndo;
+  redoBtn.disabled = !h.canRedo;
+  undoBtn.title = h.canUndo ? `Undo ${h.undoLabel} (\u2318/Ctrl+Z)` : 'Nothing to undo';
+  redoBtn.title = h.canRedo ? `Redo ${h.redoLabel} (\u2318/Ctrl+\u21e7Z)` : 'Nothing to redo';
 }
 
 // ══ structure (guides) ═══════════════════════════════════════
@@ -428,25 +479,57 @@ function firstFreeTrack(start, end) {
   return 0;
 }
 
+/** Padlock icon drawn in the current text colour (an emoji would ignore it). */
+function lockGlyph(locked) {
+  const span = el('span', { class: 'inline-block align-middle' });
+  span.innerHTML =
+    '<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.2" stroke-linecap="round">' +
+    '<rect x="2.5" y="5.5" width="7" height="5" rx="1.2" ' +
+    (locked ? 'fill="currentColor" stroke="none"/>' : '/>') +
+    (locked ? '<path d="M4.3 5.5V4a1.7 1.7 0 0 1 3.4 0v1.5"/>'
+            : '<path d="M4.3 5.5V4a1.7 1.7 0 0 1 3.4 0"/>') +
+    '</svg>';
+  return span;
+}
+
 function renderClipList() {
   const host = $('#clipList');
   host.replaceChildren();
   const list = clips();
-  $('#clipChip').textContent = `${list.length} layer${list.length === 1 ? '' : 's'}`;
+  const picked = new Set(selectedClipIds());
+  $('#clipChip').textContent = picked.size > 1
+    ? `${picked.size} of ${list.length}`
+    : `${list.length} layer${list.length === 1 ? '' : 's'}`;
 
-  [...list].sort((a, b) => a.start - b.start || a.track - b.track).forEach(c => {
+  clipsInOrder().forEach(c => {
     const role = ROLES[drivingRegion(state.project.levels, c.start).role];
-    const on = state.ui.sel?.type === 'clip' && state.ui.sel.id === c.id;
+    const on = picked.has(c.id);
+    const primary = state.ui.sel?.type === 'clip' && state.ui.sel.id === c.id;
     host.append(el('div', {
-      class: 'stage-row' + (on ? ' is-active' : ''),
+      class: 'stage-row' + (on ? ' is-active' : '') + (on && !primary ? ' opacity-80' : ''),
       style: { '--role': role.color },
-      onClick: () => select('clip', c.id)
+      // ⌘/ctrl adds one layer, ⇧ extends the run — the same gestures a file
+      // list uses, so a group can be built here as well as on the timeline.
+      onClick: e => selectClip(c.id, e.metaKey || e.ctrlKey ? 'toggle' : e.shiftKey ? 'range' : 'set')
     },
       el('span', { class: 'w-1 h-5 rounded-full shrink-0', style: { background: role.color } }),
       el('span', { class: 'flex-1 min-w-0' },
         el('div', { class: 'truncate text-[11px] text-zinc-300 leading-tight' }, (c.text || '—').replace(/\n/g, ' ')),
         el('div', { class: 'text-[9px] font-mono text-zinc-600 leading-tight' },
-          `T${c.track + 1} · ${c.start.toFixed(2)}–${c.end.toFixed(2)}s · ${EFFECTS[c.effect]?.label ?? c.effect}`)),
+          `T${c.track + 1} · ${c.start.toFixed(2)}–${c.end.toFixed(2)}s · ${stageSummary(c)}` +
+          (c.locked ? ' · locked' : ''))),
+      el('button', {
+        class: 'btn btn-ghost !px-1 !py-0.5 shrink-0 ' +
+               (c.locked ? 'text-sky-400' : 'text-zinc-700 hover:text-zinc-400'),
+        title: c.locked ? 'Timing locked — click to unlock' : 'Lock this layer\u2019s timing',
+        onClick: e => {
+          e.stopPropagation();
+          updateClip(c.id, { locked: !c.locked });
+          app.timeline.draw();
+          if (state.ui.sel?.type === 'clip' && state.ui.sel.id === c.id) buildInspector();
+        }
+      }, lockGlyph(c.locked)),
       el('button', {
         class: 'btn btn-ghost !px-1 !py-0.5 text-zinc-600 hover:text-red-400 shrink-0',
         title: 'Delete layer',
@@ -481,19 +564,54 @@ function buildInspector() {
     host.append(el('p', { class: 'text-[11px] text-zinc-600 py-3 text-center leading-relaxed' },
       state.ui.sel?.type === 'camkey'
         ? 'Camera key selected — edit it in the Camera panel below.'
+        : state.ui.sel?.type === 'camera'
+          ? 'Camera track selected — select a key below to edit its framing.'
+        : state.ui.sel?.type === 'particle'
+          ? 'Emitter selected — edit it in the Particles panel below.'
         : 'Select a layer on the timeline, or a 起承轉合 point to move a reference line.'));
     return;
   }
 
-  builtFor = 'clip:' + clip.id + '|' + clip.effect;
+  const group = selectedClips();
+  builtFor = inspectorKey(clip, group.length);
   const drive = drivingRegion(state.project.levels, clip.start);
   const role = ROLES[drive.role];
   const macro = regionAt(level('overall'), clip.start);
   const micro = regionAt(level('animation'), clip.start);
   $('#inspTitle').textContent = 'Layer';
-  $('#inspChip').textContent = `T${clip.track + 1} · ${EFFECTS[clip.effect]?.label ?? clip.effect}`;
+  $('#inspChip').textContent = group.length > 1
+    ? `${group.length} layers`
+    : `T${clip.track + 1} · ${stageSummary(clip)}`;
 
-  host.append(
+  host.append(...[
+    group.length > 1 ? el('div', { class: 'rounded-md border border-line bg-base-900 p-2 space-y-1.5' },
+      el('div', { class: 'flex items-center justify-between' },
+        el('span', { class: 'text-[11px] font-semibold text-zinc-200' }, `${group.length} layers selected`),
+        el('button', {
+          class: 'btn btn-ghost !px-1.5 !py-0.5 text-[10px]',
+          title: 'Keep only the layer this inspector edits',
+          onClick: () => { selectClip(clip.id, 'set'); app.timeline.draw(); }
+        }, 'Clear')),
+      el('p', { class: 'text-[10px] leading-snug text-zinc-500' },
+        'Drag any one of them on the timeline to move the whole group; locked layers stay put. ',
+        'The fields below edit ',
+        el('span', { class: 'text-zinc-300' }, (clip.text || '—').replace(/\n/g, ' ').slice(0, 24)),
+        ', the layer you picked last.'),
+      el('div', { class: 'grid grid-cols-2 gap-1.5' },
+        el('button', {
+          class: 'btn', onClick: () => {
+            const lock = !group.every(c => c.locked);
+            for (const c of group) updateClip(c.id, { locked: lock });
+            app.timeline.draw(); buildInspector();
+          }
+        }, group.every(c => c.locked) ? 'Unlock all' : 'Lock all'),
+        el('button', {
+          class: 'btn hover:!text-red-400', onClick: () => {
+            for (const c of group) removeClip(c.id);
+            app.timeline.draw();
+          }
+        }, `Delete ${group.length}`))) : null,
+
     el('div', { class: 'flex items-center gap-2 rounded-md border p-2',
                 style: { borderColor: role.color + '44', background: role.color + '10' } },
       el('span', { class: 'w-6 h-6 rounded-full grid place-items-center text-xs font-bold shrink-0',
@@ -510,45 +628,28 @@ function buildInspector() {
     el('div', { class: 'grid grid-cols-3 gap-1.5 text-center' },
       box('inspStart', 'In'), box('inspLen', 'Length'), box('inspEnd', 'Out')),
 
+    el('label', { class: 'tog',
+                  title: 'Hold this layer\u2019s in/out points when the composition is rescaled, and stop it being dragged or trimmed on the timeline' },
+      el('input', {
+        id: 'inspLock', type: 'checkbox', class: 'accent-sky-500', checked: clip.locked === true,
+        onChange: e => { updateClip(clip.id, { locked: e.target.checked }); app.timeline.draw(); }
+      }), ' Lock timing'),
+
     field('Text', el('textarea', {
       class: 'inp resize-y min-h-[62px] leading-snug', rows: 2, spellcheck: 'false',
       onInput: e => { updateClip(clip.id, { text: e.target.value }); app.timeline.draw(); }
     }, clip.text)),
 
-    field('Effect', el('div', { class: 'flex gap-1.5' },
-      el('select', { class: 'sel', onChange: e => { updateClip(clip.id, { effect: e.target.value, params: {} }); buildInspector(); app.timeline.draw(); } },
-        ...groupedEffectOptions(clip, role.key)),
-      el('button', {
-        class: 'btn btn-sq', title: 'Try the next effect suited to this phase',
-        onClick: () => {
-          const list = effectsForRole(role.key);
-          const next = list[(list.indexOf(clip.effect) + 1) % list.length];
-          updateClip(clip.id, { effect: next, params: {} });
-          buildInspector(); app.timeline.draw();
-        }
-      }, '⇄'))),
-
-    ...paramSliders(clip),
+    stageEditor(clip, role.key),
 
     slider('Beat reaction', clip.beatReact, 0, 1, 0.01, v => updateClip(clip.id, { beatReact: v }),
            anyAudio() ? null : 'no audio yet'),
 
-    el('div', { class: 'grid grid-cols-2 gap-2' },
-      field('Colour', el('input', {
-        type: 'color', value: clip.color, class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
-        onInput: e => updateClip(clip.id, { color: e.target.value })
-      })),
-      field('Align', el('select', { class: 'sel', onChange: e => updateClip(clip.id, { align: e.target.value }) },
-        ...['left', 'center', 'right'].map(a =>
-          el('option', { value: a, selected: clip.align === a }, a[0].toUpperCase() + a.slice(1)))))),
-
-    slider('Size', clip.size, 0.03, 0.9, 0.005, v => updateClip(clip.id, { size: v }), 'of short edge'),
-    slider('Line height', clip.lineHeight, 0.6, 2.4, 0.01, v => updateClip(clip.id, { lineHeight: v })),
-    slider('Letter spacing', clip.tracking, -0.3, 1, 0.005, v => updateClip(clip.id, { tracking: v })),
+    ...typeSection(clip),
 
     field('Position · scene units', el('div', { class: 'space-y-1.5' },
       positionFields(clip.position,
-        pos => updateClip(clip.id, { position: { ...(clip.position ?? {}), ...pos } })),
+        pos => updateClip(clip.id, { position: { ...(clip.position ?? {}), ...pos } }), 'clipPos'),
       el('button', {
         class: 'btn w-full',
         title: 'Place this text on the current camera frame',
@@ -569,7 +670,7 @@ function buildInspector() {
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
       el('button', { class: 'btn', onClick: () => duplicateClip(clip.id) }, 'Duplicate'),
       el('button', { class: 'btn hover:!text-red-400', onClick: () => removeClip(clip.id) }, 'Delete'))
-  );
+  ].filter(Boolean));
   syncInspector();
 }
 
@@ -718,22 +819,202 @@ function buildRunInspector(host, lv, picked) {
   syncInspector();
 }
 
-function groupedEffectOptions(clip, roleKey) {
+function groupedEffectOptions(selected, roleKey) {
   const mine = effectsForRole(roleKey);
   const rest = effectIds().filter(id => !mine.includes(id));
-  const opt = id => el('option', { value: id, selected: clip.effect === id }, EFFECTS[id].label);
+  const opt = id => el('option', { value: id, selected: selected === id }, EFFECTS[id].label);
   return [
     el('optgroup', { label: `Suited to ${ROLES[roleKey].cn}` }, ...mine.map(opt)),
     el('optgroup', { label: 'Other' }, ...rest.map(opt))
   ];
 }
 
-function paramSliders(clip) {
-  const def = EFFECTS[clip.effect] ?? EFFECTS.hold;
-  const p = resolveParams(clip.effect, clip.params);
+const STAGE_LABELS = { in: 'In', mid: 'Mid', out: 'Out' };
+const stageLabel = (clip, key) => EFFECTS[clipStage(clip, key).effect]?.label ?? clipStage(clip, key).effect;
+
+/** The layer's three effects, collapsed to one name when they all agree. */
+// ══ text style ═══════════════════════════════════════════════
+//
+// The stage holds one text style; a layer takes it whole and overrides only
+// what it sets. Each field therefore says where its value came from: "stage"
+// while inherited, and a ⟲ that hands it back once the layer has its own.
+
+const STYLE_LABEL = {
+  font: 'Typeface', color: 'Colour', size: 'Size',
+  lineHeight: 'Line height', tracking: 'Letter spacing', align: 'Align'
+};
+
+const ALIGNMENTS = ['left', 'center', 'right'];
+
+/** Typeface options: the loaded slots, optionally led by "from the stage". */
+function fontOptions(selected, inherit = null) {
+  const opts = inherit === null ? [] : [
+    el('option', { value: '', selected: selected === null },
+       `From stage · ${trim(state.fonts[inherit]?.name ?? '— none —', 18)}`)
+  ];
+  state.fonts.forEach((f, i) => opts.push(el('option', { value: i, selected: selected === i },
+    `${i + 1} · ${f ? trim(f.name, 22) : '— empty —'}`)));
+  return opts;
+}
+
+/** The label suffix that says where a field's value comes from. */
+function styleTag(clip, key, onRevert) {
+  const host = el('span', { class: 'ml-1 normal-case shrink-0' });
+  const paint = () => host.replaceChildren(
+    overridesStyle(clip, key)
+      ? el('button', {
+          class: 'px-1 rounded text-sky-400 hover:bg-base-600',
+          title: `Back to the stage ${STYLE_LABEL[key].toLowerCase()}`,
+          onClick: onRevert
+        }, '⟲')
+      : el('span', { class: 'text-zinc-700', title: 'Taken from the stage text style' }, 'stage'));
+  paint();
+  return { node: host, paint };
+}
+
+/** Typeface, colour and the type settings, each inherited until it is touched. */
+function typeSection(clip) {
+  const style = clipStyle(clip, state.project);
+  const tags = {};
+  const revert = key => {
+    resetClipStyle(clip.id, key);
+    buildInspector();
+    app.timeline.draw();
+  };
+  const tag = key => {
+    const t = styleTag(clip, key, () => revert(key));
+    tags[key] = t;
+    return t.node;
+  };
+  // Setting a field is what claims it from the stage, so the tag follows the
+  // edit without rebuilding the panel under the pointer.
+  const set = (key, value) => { updateClip(clip.id, { [key]: value }); tags[key]?.paint(); };
+  const row = (key, control) => el('div', {},
+    el('span', { class: 'lbl flex items-center' }, STYLE_LABEL[key], tag(key)), control);
+
+  return [
+    el('div', { class: 'flex items-center justify-between pt-1' },
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500' }, 'Type'),
+      el('button', {
+        class: 'btn btn-ghost !px-1.5 !py-0.5 text-[10px]',
+        title: 'Hand every type setting on this layer back to the stage',
+        onClick: () => { resetClipStyle(clip.id); buildInspector(); app.timeline.draw(); }
+      }, 'All from stage')),
+
+    row('font', el('select', {
+      class: 'sel',
+      onChange: e => { set('font', e.target.value === '' ? null : +e.target.value); buildInspector(); }
+    }, ...fontOptions(overridesStyle(clip, 'font') ? Number(clip.font) : null,
+                      stageStyle(state.project).font))),
+
+    el('div', { class: 'grid grid-cols-2 gap-2' },
+      row('color', el('input', {
+        type: 'color', value: style.color,
+        class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
+        onInput: e => set('color', e.target.value)
+      })),
+      row('align', el('select', { class: 'sel', onChange: e => set('align', e.target.value) },
+        ...ALIGNMENTS.map(a =>
+          el('option', { value: a, selected: style.align === a }, a[0].toUpperCase() + a.slice(1)))))),
+
+    slider('Size', style.size, 0.03, 0.9, 0.005, v => set('size', v), 'of short edge', tag('size')),
+    slider('Line height', style.lineHeight, 0.6, 2.4, 0.01, v => set('lineHeight', v), null, tag('lineHeight')),
+    slider('Letter spacing', style.tracking, -0.3, 1, 0.005, v => set('tracking', v), null, tag('tracking'))
+  ];
+}
+
+/** The stage's own text style — what every layer starts from. */
+function renderStageText() {
+  const host = $('#stageText');
+  if (!host || holdsFocus(host)) return;      // a slider here is being driven
+  host.replaceChildren();
+  const s = stageStyle(state.project);
+  // A select replaces its own options, so those rebuild the panel; the colour
+  // swatch and the sliders write straight through and stay under the pointer.
+  const pick = props => { setTextStyle(props); renderStageText(); };
+
+  host.append(
+    el('div', { class: 'flex items-center justify-between' },
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500' }, 'Stage text'),
+      el('span', { class: 'chip' }, 'every layer inherits')),
+
+    field('Typeface', el('select', { class: 'sel', onChange: e => pick({ font: +e.target.value }) },
+      ...fontOptions(s.font))),
+
+    el('div', { class: 'grid grid-cols-2 gap-2' },
+      field('Colour', el('input', {
+        type: 'color', value: s.color,
+        class: 'w-full h-8 bg-base-900 border border-line rounded cursor-pointer',
+        onInput: e => setTextStyle({ color: e.target.value })
+      })),
+      field('Align', el('select', { class: 'sel', onChange: e => pick({ align: e.target.value }) },
+        ...ALIGNMENTS.map(a =>
+          el('option', { value: a, selected: s.align === a }, a[0].toUpperCase() + a.slice(1)))))),
+
+    slider('Size', s.size, 0.03, 0.9, 0.005, v => setTextStyle({ size: v }), 'of short edge'),
+    slider('Line height', s.lineHeight, 0.6, 2.4, 0.01, v => setTextStyle({ lineHeight: v })),
+    slider('Letter spacing', s.tracking, -0.3, 1, 0.005, v => setTextStyle({ tracking: v })),
+
+    el('p', { class: 'text-[10px] leading-relaxed text-zinc-600' },
+      'A layer follows these until you change the same setting on the layer itself; ',
+      'its inspector marks what it has taken over.')
+  );
+}
+
+const stageSummary = clip =>
+  [...new Set(STAGE_KEYS.map(key => stageLabel(clip, key)))].join(' › ');
+
+/** Rebuilding the panel is only needed when the controls themselves change. */
+const inspectorKey = (clip, groupSize) =>
+  'clip:' + clip.id + '|' + STAGE_KEYS.map(key => clipStage(clip, key).effect).join(',') +
+  '|' + groupSize +
+  // Inherited fields show the stage's values, so a change there redraws them.
+  '|' + TEXT_STYLE_KEYS.map(key => stageStyle(state.project)[key]).join(',');
+
+/**
+ * In · mid · out: one effect each, over one slice of the layer each. Only in
+ * and out carry a length — mid is the remainder, and reads back as one — which
+ * is the same rule the two handles on the timeline block follow.
+ */
+function stageEditor(clip, roleKey) {
+  const len = Math.max(0, clip.end - clip.start);
+  return el('div', { class: 'space-y-1.5' },
+    el('span', { class: 'lbl' }, 'Effects · in › mid › out'),
+    ...stageWindows(clip).map(w => {
+      const stage = clipStage(clip, w.key);
+      return el('div', { class: 'rounded-md border border-line bg-base-900 p-1.5 space-y-1' },
+        el('div', { class: 'flex items-center gap-1.5' },
+          el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500 w-6 shrink-0' },
+             STAGE_LABELS[w.key]),
+          el('select', {
+            class: 'sel !py-0.5 !text-[10px] flex-1 min-w-0',
+            title: `Effect played over the ${w.key} stage`,
+            onChange: e => setClipStage(clip.id, w.key, { effect: e.target.value })
+          }, ...groupedEffectOptions(stage.effect, roleKey)),
+          w.key === 'mid'
+            ? el('div', {
+                id: 'stageDurMid',
+                class: 'w-14 shrink-0 text-center text-[10px] font-mono text-zinc-500',
+                title: 'Whatever the in and out stages leave'
+              }, `${w.dur.toFixed(2)}s`)
+            : el('input', {
+                id: 'stageDur' + STAGE_LABELS[w.key],
+                type: 'number', min: 0, max: round(len, 2), step: '0.05',
+                value: round(w.dur, 2),
+                class: 'inp !w-14 !py-0.5 !text-[10px] font-mono text-center',
+                title: `How long the ${w.key} stage runs, in seconds`,
+                onChange: e => setStageDuration(clip.id, w.key, +e.target.value || 0)
+              })),
+        ...stageParamSliders(clip, w.key, stage));
+    }));
+}
+
+function stageParamSliders(clip, key, stage) {
+  const def = EFFECTS[stage.effect] ?? EFFECTS.hold;
+  const p = resolveParams(stage.effect, stage.params);
   return def.params.map(pm =>
     slider(pm.label, p[pm.key], pm.min, pm.max, pm.step, v =>
-      updateClip(clip.id, { params: { ...clip.params, [pm.key]: v } })));
+      setClipStage(clip.id, key, { params: { ...(clip.stages?.[key]?.params ?? {}), [pm.key]: v } })));
 }
 
 function box(id, label) {
@@ -746,28 +1027,95 @@ function field(label, node) {
   return el('div', {}, el('span', { class: 'lbl' }, label), node);
 }
 
-function slider(label, value, min, max, step, onChange, hint = null) {
-  const val = el('span', { class: 'text-zinc-400 font-mono normal-case' }, fmtNum(value));
-  return el('div', {},
-    el('span', { class: 'lbl flex items-center justify-between' },
-      el('span', {}, label, hint ? el('span', { class: 'text-zinc-700 ml-1 normal-case' }, `(${hint})`) : null),
-      val),
-    el('input', {
-      type: 'range', min, max, step, value, class: 'w-full',
-      onInput: e => { const v = +e.target.value; val.textContent = fmtNum(v); onChange(v); }
-    }));
+/**
+ * Tie a slider to an editable readout, so a value can be dragged for feel or
+ * typed when the step would never land on it.
+ *
+ * Typed digits take effect as they are entered, but the field is only
+ * rewritten once the edit finishes — rewriting it under the cursor would clamp
+ * the "1" of a "15" being typed. Enter commits, Esc goes back to the value the
+ * field was entered with. The range must already hold the current value.
+ */
+function linkRange(range, num, onChange) {
+  const lo = Number(range.min), hi = Number(range.max);
+  // Follow the step's own precision, so a typed value survives being reread.
+  const dec = Math.min(3, (String(range.step).split('.')[1] ?? '').length);
+  const fmt = v => Number(v).toFixed(dec);
+  for (const key of ['min', 'max', 'step']) num.setAttribute(key, range.getAttribute(key));
+  num.title = `${fmt(lo)} – ${fmt(hi)}`;
+  num.value = fmt(range.value);
+
+  const apply = (v, rewrite) => {
+    const next = clamp(v, lo, hi);
+    range.value = next;
+    if (rewrite) num.value = fmt(next);
+    onChange(next);
+  };
+
+  let entry = Number(range.value);        // what Esc goes back to
+  range.addEventListener('input', e => { const v = +e.target.value; num.value = fmt(v); onChange(v); });
+  num.addEventListener('focus', e => { entry = +range.value; e.target.select(); });
+  num.addEventListener('input', e => {
+    const v = parseFloat(e.target.value);
+    if (Number.isFinite(v) && v >= lo && v <= hi) apply(v, false);
+  });
+  num.addEventListener('change', e => {
+    const v = parseFloat(e.target.value);
+    if (Number.isFinite(v)) apply(v, true);
+    else num.value = fmt(+range.value);
+  });
+  num.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); num.blur(); }
+    else if (e.key === 'Escape') { e.preventDefault(); apply(entry, true); num.blur(); }
+  });
+  return { sync: v => { range.value = v; num.value = fmt(v); } };
 }
 
-/** Three editable world-space coordinates shared by text and camera objects. */
-function positionFields(position = {}, onChange) {
+function slider(label, value, min, max, step, onChange, hint = null, badge = null) {
+  const start = Number.isFinite(Number(value)) ? Number(value) : Number(min) || 0;
+  const range = el('input', { type: 'range', min, max, step, value: start, class: 'w-full' });
+  const num = el('input', { type: 'number', class: 'num', spellcheck: 'false' });
+  linkRange(range, num, onChange);
+  return el('div', {},
+    el('span', { class: 'lbl flex items-center justify-between gap-2' },
+      el('span', { class: 'min-w-0 truncate flex items-center' },
+        el('span', { class: 'truncate' },
+          label, hint ? el('span', { class: 'text-zinc-700 ml-1 normal-case' }, `(${hint})`) : null),
+        badge),
+      num),
+    range);
+}
+
+/**
+ * Three editable world-space coordinates shared by text and camera objects.
+ * `idPrefix` names the inputs so another control — the stage move handle —
+ * can write its result back into them without rebuilding the panel.
+ */
+function positionFields(position = {}, onChange, idPrefix = '') {
   const p = { x: Number(position.x) || 0, y: Number(position.y) || 0, z: Number(position.z) || 0 };
   return el('div', { class: 'grid grid-cols-3 gap-1.5' },
     ...['x', 'y', 'z'].map(axis => el('label', { class: 'block' },
       el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600' }, axis),
       el('input', {
         type: 'number', step: '0.1', value: round(p[axis], 1),
+        id: idPrefix ? idPrefix + axis.toUpperCase() : null,
         class: 'inp !py-1 font-mono text-[11px]',
         onChange: e => onChange({ [axis]: Number.isFinite(Number(e.target.value)) ? Number(e.target.value) : 0 })
+      }))));
+}
+
+/**
+ * A row of small numeric fields, given as [label, key] pairs read off `obj`.
+ * `positionFields` is the x/y/z case; this is the same control for any triple.
+ */
+function numberFields(pairs, obj = {}, onChange) {
+  return el('div', { class: 'grid grid-cols-3 gap-1.5' },
+    ...pairs.map(([label, key]) => el('label', { class: 'block' },
+      el('span', { class: 'text-[9px] uppercase tracking-wider text-zinc-600' }, label),
+      el('input', {
+        type: 'number', step: '1', min: '0', value: round(Number(obj[key]) || 0, 1),
+        class: 'inp !py-1 font-mono text-[11px]',
+        onChange: e => onChange({ [key]: Number.isFinite(Number(e.target.value)) ? Number(e.target.value) : 0 })
       }))));
 }
 
@@ -790,10 +1138,26 @@ function syncInspector() {
   const guide = selectedGuide();
 
   if (clip) {
-    if (builtFor !== 'clip:' + clip.id + '|' + clip.effect) { buildInspector(); return; }
+    if (builtFor !== inspectorKey(clip, selectedClipIds().length)) {
+      buildInspector(); return;
+    }
     set('#inspStart', fmtTime(clip.start));
     set('#inspLen', `${(clip.end - clip.start).toFixed(2)}s`);
     set('#inspEnd', fmtTime(clip.end));
+    // Stage lengths also move from the timeline, so the fields follow the drag.
+    for (const w of stageWindows(clip)) {
+      const n = $('#stageDur' + STAGE_LABELS[w.key]);
+      if (!n) continue;
+      if (w.key === 'mid') n.textContent = `${w.dur.toFixed(2)}s`;
+      else if (document.activeElement !== n) n.value = round(w.dur, 2);
+    }
+    const lock = $('#inspLock');
+    if (lock && document.activeElement !== lock) lock.checked = clip.locked === true;
+    // Dragging the layer on stage writes here, so the numbers follow the handle.
+    for (const axis of ['x', 'y', 'z']) {
+      const n = $('#clipPos' + axis.toUpperCase());
+      if (n && document.activeElement !== n) n.value = round(Number(clip.position?.[axis]) || 0, 1);
+    }
   } else if (guide) {
     const g = guide.guide, lv = guide.level;
     const picked = selectedGuideIndices(lv.key);
@@ -861,12 +1225,25 @@ function renderVideoChannels() {
     ? loaded.map(({ meta, count }) => `${meta.short}${count > 1 ? ` ×${count}` : ''}`).join(' · ')
     : 'none';
 
-  const pick = (kind, replaceId = null) => {
-    const inp = $('#videoFile');
-    inp.dataset.kind = kind;
-    inp.dataset.replaceId = replaceId ?? '';
-    inp.multiple = !replaceId;
-    inp.click();
+  const pick = async (kind, replaceId = null) => {
+    const picked = await pickVideoFiles({ multiple: !replaceId });
+    if (picked === null) {                         // no File System Access API here
+      const inp = $('#videoFile');
+      inp.dataset.kind = kind;
+      inp.dataset.replaceId = replaceId ?? '';
+      inp.multiple = !replaceId;
+      inp.click();
+      return;
+    }
+    for (const [index, { file, handle }] of picked.entries()) {
+      await app.importVideo(file, kind, index === 0 ? replaceId : null, { handle });
+    }
+  };
+  /** Attach a saved backdrop from its remembered handle, or ask for the file. */
+  const attach = async (kind, clip) => {
+    const file = await requestMedia(clip).catch(() => null);
+    if (file) { await app.importVideo(file, kind, clip.id); return; }
+    pick(kind, clip.id);
   };
 
   const effectOptions = selected => VIDEO_EFFECTS.map(effect =>
@@ -914,7 +1291,7 @@ function renderVideoChannels() {
         el('button', {
           class: 'btn btn-sq !w-6 !h-6',
           title: ready ? 'Replace this video source' : 'Attach this saved video source',
-          onClick: () => pick(meta.kind, clip.id)
+          onClick: () => (ready ? pick(meta.kind, clip.id) : attach(meta.kind, clip))
         }, ready ? '⤒' : '↗'),
         el('button', {
           class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400',
@@ -1076,10 +1453,15 @@ function syncVideoPanel() {
 function buildAudioPanel() {
   $('#audioFile').addEventListener('change', e => {
     const kind = e.target.dataset.kind || 'bgm';
+    const attachId = e.target.dataset.attachId || null;
     const files = [...(e.target.files ?? [])];
-    // Music stays a single source; VO/SFX may be inserted as a batch.
-    const chosen = kind === 'bgm' ? files.slice(0, 1) : files;
-    chosen.reduce((chain, file) => chain.then(() => app.importAudio(file, kind)), Promise.resolve());
+    // Music stays a single source; VO/SFX may be inserted as a batch — unless
+    // the pick came from one saved clip's attach button.
+    const chosen = kind === 'bgm' || attachId ? files.slice(0, 1) : files;
+    chosen.reduce((chain, file, index) =>
+      chain.then(() => app.importAudio(file, kind, index === 0 ? attachId : null)), Promise.resolve());
+    e.target.dataset.kind = '';
+    e.target.dataset.attachId = '';
     e.target.value = '';
   });
 
@@ -1131,19 +1513,37 @@ function renderAudioLanes() {
   for (const meta of TRACK_KINDS) {
     const isBgm = meta.kind === 'bgm';
     const tr = isBgm ? track('bgm') : null;
-    const lane = audioClips(meta.kind);
+    const lane = savedAudioClips(meta.kind);
     const loaded = lane.filter(clip => clip.ready);
-    const pick = () => {
-      const inp = $('#audioFile');
-      inp.dataset.kind = meta.kind;
-      inp.multiple = !isBgm;
-      inp.click();
+    const pending = lane.filter(clip => !clip.ready);
+    const multiple = () => !isBgm;
+    const pick = async (attachId = null) => {
+      const picked = await pickAudioFiles({ multiple: multiple() && !attachId });
+      if (picked === null) {                       // no File System Access API here
+        const inp = $('#audioFile');
+        inp.dataset.kind = meta.kind;
+        inp.dataset.attachId = attachId ?? '';
+        inp.multiple = multiple() && !attachId;
+        inp.click();
+        return;
+      }
+      for (const [index, { file, handle }] of picked.entries()) {
+        await app.importAudio(file, meta.kind, index === 0 ? attachId : null, { handle });
+      }
+    };
+    // The ↗ on a pending clip: a remembered handle only needs this click to be
+    // allowed, so try that before sending the user back to the file dialog.
+    const attach = async clip => {
+      const file = await requestMedia(clip).catch(() => null);
+      if (file) { await app.importAudio(file, meta.kind, clip.id); return; }
+      pick(clip.id);
     };
 
     const head = el('div', { class: 'flex items-center gap-1.5' },
       el('span', {
         class: 'w-9 shrink-0 text-[9px] font-mono uppercase tracking-wider ' +
-               (loaded.length ? 'text-zinc-300' : 'text-zinc-600')
+               (loaded.length ? 'text-zinc-300' : pending.length ? 'text-amber-500/80' : 'text-zinc-600'),
+        title: pending.length ? `${pending.length} saved clip${pending.length === 1 ? '' : 's'} waiting to be attached` : ''
       }, meta.short),
       isBgm && tr.ready
         ? el('span', { class: 'flex-1 min-w-0 truncate text-[11px] text-zinc-300', title: tr.name }, tr.name)
@@ -1165,8 +1565,28 @@ function renderAudioLanes() {
       }, '✕') : null
     );
 
-    const body = loaded.map(clip => {
+    const body = lane.map(clip => {
       const controls = el('div', { class: 'pl-9 space-y-1.5' });
+      // A project file references media by name, never its bytes. Saved clips
+      // stay visible here so their timing survives until the file is attached.
+      if (!clip.ready) {
+        const slip = clip.start ? ` · at ${clip.start > 0 ? '+' : ''}${round(clip.start, 2)}s` : '';
+        controls.append(el('div', { class: 'flex items-center gap-1.5' },
+          el('span', {
+            class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-500',
+            title: `${clip.name || 'Unattached clip'} — re-import this file to attach it`
+          }, `○ ${clip.name || 'Unattached clip'}${slip} · re-import to attach`),
+          el('button', {
+            class: 'btn btn-sq !w-6 !h-6', title: 'Attach this saved source',
+            onClick: () => attach(clip)
+          }, '↗'),
+          el('button', {
+            class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Remove clip',
+            onClick: () => app.clearAudio(meta.kind, isBgm ? null : clip.id)
+          }, '✕')
+        ));
+        return controls;
+      }
       if (!isBgm) {
         controls.append(el('div', { class: 'flex items-center gap-1.5' },
           el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400', title: clip.name }, clip.name),
@@ -1249,11 +1669,16 @@ export function setAudioProgress(v, label) {
 function syncAudioPanel() {
   const a = state.audio;
   const bgm = track('bgm');
-  const loaded = TRACK_KINDS.map(meta => ({ meta, count: audioClips(meta.kind).filter(clip => clip.ready).length }))
-    .filter(({ count }) => count > 0);
+  const loaded = TRACK_KINDS
+    .map(meta => {
+      const lane = savedAudioClips(meta.kind);
+      return { meta, count: lane.filter(clip => clip.ready).length, pending: lane.filter(clip => !clip.ready).length };
+    })
+    .filter(({ count, pending }) => count > 0 || pending > 0);
 
   $('#audioChip').textContent = loaded.length
-    ? loaded.map(({ meta, count }) => `${meta.short}${count > 1 ? ` ×${count}` : ''}`).join(' · ')
+    ? loaded.map(({ meta, count, pending }) =>
+        `${meta.short}${count > 1 ? ` ×${count}` : ''}${pending ? ` +${pending} pending` : ''}`).join(' · ')
     : 'no audio';
   $('#audioInfo').classList.toggle('hidden', !bgm.ready);
   $('#tSnapWords').checked = state.ui.snapWords;
@@ -1543,6 +1968,12 @@ function renderSplitCameraPanel(host) {
 }
 
 function renderCameraPanel() {
+  // The camera settings only make sense while the CAM track (or one of its
+  // keys) is what's selected — otherwise the panel is out of the way.
+  const shown = state.ui.sel?.type === 'camera' || state.ui.sel?.type === 'camkey';
+  $('#camPanel').classList.toggle('hidden', !shown);
+  if (!shown) return;
+
   const cam = camera();
   const keys = cameraKeys();
   $('#camEnabled').checked = cam.enabled;
@@ -1671,7 +2102,7 @@ function renderEmitterList() {
   const host = $('#emitterList');
   if (!host) return;
   const list = particleEmitters();
-  const current = selectedEmitter();
+  const current = activeEmitterId();
   const on = list.filter(e => e.on).length;
   $('#particleChip').textContent = list.length
     ? `${list.length} emitter${list.length === 1 ? '' : 's'}${on === list.length ? '' : ` · ${on} on`}`
@@ -1679,7 +2110,7 @@ function renderEmitterList() {
 
   host.replaceChildren();
   list.forEach((e, i) => host.append(el('div', {
-    class: 'stage-row' + (current?.id === e.id ? ' is-active' : ''),
+    class: 'stage-row' + (current === e.id ? ' is-active' : ''),
     style: { '--role': e.colorA },
     onClick: () => selectEmitter(e.id)
   },
@@ -1743,7 +2174,11 @@ function renderParticlePanel() {
   const host = $('#particlePanel');
   if (!host || holdsFocus(host)) return;      // never rebuild under a dragged slider
 
-  const s = selectedEmitter();
+  // Only the emitter list stays up front; the settings themselves wait until an
+  // emitter track is the selection, the way the Camera panel does.
+  const s = state.ui.sel?.type === 'particle' ? selectedEmitter() : null;
+  host.classList.toggle('hidden', !s);
+  $('#particleHint')?.classList.toggle('hidden', !!s || !particleEmitters().length);
   host.replaceChildren();
   if (!s) return;
 
@@ -1766,8 +2201,28 @@ function renderParticlePanel() {
       selectField('Shape', s.shape, PARTICLE_SHAPES, v => set({ shape: v })),
       selectField('Born from', s.origin, PARTICLE_ORIGINS, v => set({ origin: v }))),
 
-    field(s.origin === 'point' ? 'Emitter position' : 'Emitter offset',
-      positionFields(s, props => set(props))),
+    field(s.origin === 'point' || s.origin === 'box' ? 'Emitter position' : 'Emitter offset',
+      el('div', { class: 'space-y-1.5' },
+        positionFields(s, props => set(props)),
+        el('button', {
+          class: 'btn w-full',
+          title: s.origin === 'point' || s.origin === 'box'
+            ? 'Place this emitter on the current camera frame'
+            : 'Offset this emitter onto the current camera frame',
+          onClick: () => {
+            alignEmitterWithCamera(s.id);
+            renderParticlePanel();
+          }
+        }, 'Align with camera'))),
+
+    // The box is centred on the emitter position, so its size sits with it.
+    s.origin !== 'box' ? null : field('Box size \u00b7 scene units',
+      el('div', { class: 'space-y-1.5' },
+        numberFields([['w', 'boxW'], ['h', 'boxH'], ['d', 'boxD']], s, props => set(props)),
+        el('button', {
+          class: 'btn w-full', title: 'Match the box to the composition frame',
+          onClick: () => set({ boxW: state.project.width, boxH: state.project.height })
+        }, 'Fit to frame'))),
 
     sl('Rate', 'rate', 0, 400, 1, 'per second'),
     sl('Burst on beat', 'burst', 0, 200, 1),
@@ -1781,7 +2236,7 @@ function renderParticlePanel() {
     sl('Drag', 'drag', 0, 6, 0.01),
     sl('Turbulence', 'turbulence', 0, 800, 1),
     sl('Spin', 'spin', 0, 12, 0.05),
-    sl('Depth spread', 'spawnDepth', 0, 2000, 5),
+    s.origin === 'box' ? null : sl('Depth spread', 'spawnDepth', 0, 2000, 5),
 
     el('div', { class: 'grid grid-cols-2 gap-2' },
       colorField('Newborn', s.colorA, v => set({ colorA: v })),
@@ -1810,25 +2265,142 @@ function renderParticlePanel() {
 }
 
 // ══ look ═════════════════════════════════════════════════════
+function renderBackdropPanel() {
+  const host = $('#backdropEditor');
+  if (!host || holdsFocus(host)) return;
+  const b = backdrop();
+  const keys = backdropKeys();
+  const key = selectedBackdropKey();
+  const target = key ?? b;
+  const live = backdropAt(b, state.ui.time);
+  const modeLabel = BACKDROP_MODES.find(item => item.id === b.mode)?.label ?? b.mode;
+  const setValue = props => {
+    const current = selectedBackdropKey();
+    if (current) updateBackdropKey(current.id, props);
+    else setBackdrop(props);
+  };
+  const setColor = (index, color) => {
+    const colors = [...target.colors];
+    colors[index] = color;
+    setValue({ colors });
+  };
+  const color = (label, index) => colorField(label, target.colors[index], value => setColor(index, value));
+  const keyLabel = key
+    ? `Key ${keys.indexOf(key) + 1} · ${key.t.toFixed(2)}s`
+    : keys.length ? 'Base look · select a key to edit it' : 'Base look';
+
+  const keyList = el('div', { class: 'space-y-1' });
+  if (!keys.length) {
+    keyList.append(el('p', { class: 'text-[10px] text-zinc-600' },
+      'No keyframes yet — add one here or double-click the BG track.'));
+  } else {
+    keys.forEach((item, index) => {
+      const active = item.id === key?.id;
+      const row = el('div', {
+        class: 'flex items-center gap-1 rounded border px-1.5 py-1 ' +
+          (active ? 'border-zinc-300/60 bg-base-600' : 'border-line bg-base-900'),
+        onClick: () => selectBackdropKey(item.id)
+      },
+        el('span', {
+          class: 'w-3 h-3 rotate-45 shrink-0 border border-black/60',
+          style: { background: backdropCss({ ...item, mode: b.mode }) },
+          title: `Backdrop key ${index + 1}`
+        }),
+        el('input', {
+          type: 'number', step: '0.05', min: 0, max: state.project.duration,
+          value: round(item.t, 2), title: 'Key time',
+          class: 'inp !w-[70px] !py-0.5 !text-[10px] font-mono text-center',
+          onChange: e => {
+            updateBackdropKey(item.id, {
+              t: clamp(+e.target.value || 0, 0, state.project.duration)
+            });
+            e.target.blur();
+            renderBackdropPanel();
+            app.timeline.draw();
+          }
+        }),
+        el('span', { class: 'text-[9px] text-zinc-600' }, 's'),
+        el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-500' },
+          item.id === key?.id ? keyLabel : `Key ${index + 1}`),
+        el('select', {
+          class: 'sel !w-[76px] !py-0.5 !text-[10px]', title: 'Easing out of this key',
+          onChange: e => updateBackdropKey(item.id, { ease: e.target.value })
+        }, ...Object.entries(EASES).map(([id, ease]) =>
+          el('option', { value: id, selected: item.ease === id }, ease.label))),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Delete this backdrop key',
+          onClick: e => { e.stopPropagation(); removeBackdropKey(item.id); app.timeline.draw(); }
+        }, '✕')
+      );
+      keyList.append(row);
+    });
+  }
+
+  const colors = b.mode === 'solid'
+    ? color('Colour', 0)
+    : b.mode === 'four-point'
+      ? el('div', { class: 'grid grid-cols-2 gap-2' },
+          color('Top left', 0), color('Top right', 1), color('Bottom left', 2), color('Bottom right', 3))
+      : el('div', { class: 'grid grid-cols-2 gap-2' }, color('Start', 0), color('End', 1));
+
+  host.replaceChildren(
+    el('div', { class: 'flex items-center justify-between' },
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500' }, 'Backdrop colour'),
+      el('span', { class: 'chip' }, `${keys.length} key${keys.length === 1 ? '' : 's'}`)),
+
+    el('div', { class: 'rounded-md border border-line bg-base-900 p-2 space-y-2' },
+      el('div', { class: 'h-12 rounded border border-white/10 shadow-inner', style: { background: backdropCss(live) },
+                 title: `Backdrop at ${state.ui.time.toFixed(2)}s` }),
+      el('div', { class: 'flex items-center gap-1.5' },
+        el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400' }, keyLabel),
+        el('button', {
+          class: 'btn !px-1.5 !py-1 !text-[10px]', title: 'Add or select a key at the playhead',
+          onClick: () => { addBackdropKey(state.ui.time); app.timeline.draw(); renderBackdropPanel(); }
+        }, '+ Keyframe')),
+      el('div', { class: 'grid grid-cols-2 gap-1.5' },
+        el('button', {
+          class: 'btn !py-1 !text-[10px]', title: 'Select the backdrop track',
+          onClick: () => { selectBackdropTrack(); renderBackdropPanel(); }
+        }, 'Edit base'),
+        el('button', {
+          class: 'btn !py-1 !text-[10px] hover:!text-red-400', title: 'Remove all backdrop colour keys',
+          onClick: () => { clearBackdropTrack(); app.timeline.draw(); }
+        }, 'Clear keys'))),
+
+    selectField('Type', b.mode, BACKDROP_MODES, mode => {
+      setBackdrop({ mode });
+      renderBackdropPanel();
+      app.timeline.draw();
+    }),
+
+    colors,
+    b.mode === 'linear'
+      ? slider('Angle', target.angle, 0, 360, 1, value => setValue({ angle: value }), 'degrees')
+      : null,
+    b.mode === 'radial'
+      ? el('div', { class: 'space-y-2.5' },
+          slider('Center X', target.center.x, 0, 1, 0.01, value => setValue({ center: { x: value } }), '%'),
+          slider('Center Y', target.center.y, 0, 1, 0.01, value => setValue({ center: { y: value } }), '%'),
+          slider('Radius', target.radius, 0.1, 2, 0.01, value => setValue({ radius: value }), 'frame units'))
+      : null,
+    el('div', { class: 'pt-1 border-t border-line/70' }, keyList),
+    el('p', { class: 'text-[10px] leading-relaxed text-zinc-600' },
+      `${modeLabel} is rendered behind backdrop video. Add a key at one time, change its colours, then add another key to transition between them.`)
+  );
+}
+
 function buildLookPanel() {
   const p = state.project;
-  const bind = (id, key, fmt) => {
-    const n = $(id);
-    n.value = p[key];
-    const label = $(id + 'Val');
-    const show = () => { if (label) label.textContent = fmt ? fmt(p[key]) : p[key]; };
-    n.addEventListener('input', e => {
-      p[key] = +e.target.value;
-      show(); emit('render');
-      if (key === 'depth') app.renderer.invalidate();
-    });
-    show();
+  const bind = (id, key, after = null) => {
+    const range = $(id);
+    range.value = p[key];
+    linkRange(range, $(id + 'Val'), v => { p[key] = v; emit('render'); after?.(); });
   };
-  $('#bgColor').value = p.bg;
-  $('#bgColor').addEventListener('input', e => { p.bg = e.target.value; emit('render'); });
-  bind('#vignette', 'vignette', v => v.toFixed(2));
-  bind('#grain', 'grain', v => v.toFixed(3));
-  bind('#depth', 'depth', v => `${v}px`);
+  bind('#vignette', 'vignette');
+  bind('#grain', 'grain');
+  bind('#depth', 'depth', () => app.renderer.invalidate());
+
+  renderBackdropPanel();
 
   $('#tSafe').addEventListener('change', e => {
     state.ui.safeArea = e.target.checked;
@@ -1857,7 +2429,7 @@ function syncTime() {
   $('#frameNow').textContent = `f ${Math.round(t * state.project.fps)}`;
   const macro = regionAt(level('overall'), t);
   const micro = regionAt(level('animation'), t);
-  const live = clips().filter(c => t >= c.start && t < c.end).length;
+  const live = clips().filter(c => clipLive(c, t, state.project)).length;
   const chip = $('#vpStage');
   chip.textContent = `${macro ? ROLES[macro.role].cn : '–'} / ${micro ? ROLES[micro.role].cn : '–'} · ${live} live`;
   chip.style.color = ROLES[(micro ?? macro ?? { role: 'cheng' }).role].color;
@@ -1869,9 +2441,20 @@ function buildShortcuts() {
     const active = document.activeElement;
     const tag = active?.tagName;
     const isSlider = tag === 'INPUT' && active.type === 'range';
+    const inField = tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && !isSlider);
+
+    // Undo is the one shortcut a slider must not swallow. Inside a text field
+    // the browser's own undo is the better one, so leave that alone.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && 'zy'.includes(e.key.toLowerCase())) {
+      if (inField) return;
+      e.preventDefault();
+      if (e.key.toLowerCase() === 'y' || e.shiftKey) redo(); else undo();
+      app.timeline.draw();
+      return;
+    }
 
     // text fields and menus swallow everything
-    if (tag === 'TEXTAREA' || tag === 'SELECT' || (tag === 'INPUT' && !isSlider)) return;
+    if (inField) return;
 
     // a focused slider owns the arrow keys; Esc hands the keyboard back to the
     // timeline, and space still plays because a range does nothing with it
@@ -1908,7 +2491,7 @@ function buildShortcuts() {
       case 'ArrowRight': e.preventDefault(); app.seek(state.ui.time + (e.shiftKey ? frame * 10 : frame)); break;
       case 'ArrowUp': case 'ArrowDown': {
         e.preventDefault();
-        const list = [...clips()].sort((a, b) => a.start - b.start);
+        const list = clipsInOrder();
         if (!list.length) break;
         const i = list.findIndex(c => c.id === state.ui.sel?.id);
         const n = clamp(i + (e.key === 'ArrowDown' ? 1 : -1), 0, list.length - 1);
@@ -1918,7 +2501,15 @@ function buildShortcuts() {
       case 'Backspace': case 'Delete': {
         const ck = selectedCamKey();
         if (ck) { e.preventDefault(); removeCameraKey(ck.id, selectedCamAxis()); app.timeline.draw(); }
-        else if (clip) { e.preventDefault(); removeClip(clip.id); }
+        else if (selectedBackdropKey()) {
+          e.preventDefault();
+          removeBackdropKey(selectedBackdropKey().id);
+          app.timeline.draw();
+        } else if (clip) {
+          e.preventDefault();
+          for (const c of selectedClips()) removeClip(c.id);
+          app.timeline.draw();
+        }
         break;
       }
       case '[': if (clip) app.seek(clip.start); break;
@@ -1926,6 +2517,10 @@ function buildShortcuts() {
       case 'Escape': {
         const sel = state.ui.sel;
         if (sel?.type === 'guide' && (sel.ids?.length ?? 1) > 1) select('guide', sel.id, sel.level);
+        else if (sel?.type === 'clip' && (sel.ids?.length ?? 1) > 1) {
+          selectClip(sel.id, 'set');
+          app.timeline.draw();
+        }
         break;
       }
       case 'f': app.timeline.fit(); break;

@@ -39,6 +39,7 @@ export const PARTICLE_SHAPES = [
 
 export const PARTICLE_ORIGINS = [
   { id: 'area',    label: 'Whole frame' },
+  { id: 'box',     label: 'Box volume' },
   { id: 'point',   label: 'Point' },
   { id: 'bottom',  label: 'Bottom edge' },
   { id: 'top',     label: 'Top edge' },
@@ -85,6 +86,12 @@ export function makeEmitter(props = {}, { duration = 24 } = {}) {
     y: num(s.y, 0, -8000, 8000),
     z: num(s.z, 0, -8000, 8000),
     spawnDepth: num(s.spawnDepth, 0, 0, 2000),
+
+    // The 'box' origin's extent, centred on the emitter position. It replaces
+    // `spawnDepth` on that origin: the box carries its own depth.
+    boxW: num(s.boxW, 800, 0, 8000),
+    boxH: num(s.boxH, 800, 0, 8000),
+    boxD: num(s.boxD, 400, 0, 8000),
 
     rate: num(s.rate, 90, 0, 400),
     burst: num(s.burst, 0, 0, 200),           // extra particles on every beat
@@ -444,6 +451,13 @@ export class ParticleField {
       case 'point':
         angle += (r() * 2 - 1) * cone;
         break;
+      // A point given volume: born anywhere inside the box, but still fired
+      // along the emitter's direction cone.
+      case 'box':
+        px = s.x + (r() - 0.5) * s.boxW;
+        py = s.y + (r() - 0.5) * s.boxH;
+        angle += (r() * 2 - 1) * cone;
+        break;
       case 'bottom':
         px = s.x + (r() - 0.5) * W; py = s.y - H / 2;
         angle = Math.PI / 2 + (r() * 2 - 1) * cone * 0.5;
@@ -470,10 +484,11 @@ export class ParticleField {
     const speed = s.speed * (0.55 + 0.9 * r());
     this.pos[p3] = px;
     this.pos[p3 + 1] = py;
-    this.pos[p3 + 2] = s.z + (r() - 0.5) * s.spawnDepth;
+    const depth = s.origin === 'box' ? s.boxD : s.spawnDepth;
+    this.pos[p3 + 2] = s.z + (r() - 0.5) * depth;
     this.vel[p3] = Math.cos(angle) * speed;
     this.vel[p3 + 1] = Math.sin(angle) * speed;
-    this.vel[p3 + 2] = (r() - 0.5) * s.spawnDepth * 0.25;
+    this.vel[p3 + 2] = (r() - 0.5) * depth * 0.25;
     this.age[i] = 0;
     this.ttl[i] = Math.max(0.05, s.life * (1 - s.lifeJitter * 0.5 + r() * s.lifeJitter));
     this.aSize[i] = Math.max(0.4, s.size * (1 - s.sizeJitter * 0.5 + r() * s.sizeJitter));

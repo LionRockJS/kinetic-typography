@@ -8,12 +8,13 @@
 // effect over its own span, and the track index decides what sits in front.
 
 import * as THREE from 'three';
-import { layoutText, glyphGeometry, glyphOutline, pruneGeometryCache } from './typography.js';
-import { applyEffect, resolveParams } from './effects.js';
+import { layoutText, glyphGeometry, glyphOutline, pruneGeometryCache, orderFonts } from './typography.js';
+import { applyEffect, resolveParams, clipStage, stageAt, stageU, clipLive, clipStyle } from './effects.js';
 import { cameraAt, FOV, defaultCameraPosition, cameraKeyEntries } from './camera.js';
 import { VIDEO_CHANNEL_KINDS } from './video/engine.js';
 import { ParticleField, MAX_COLLIDERS } from './particles.js';
 import { clamp } from './util.js';
+import { backdropAt } from './state.js';
 
 const OVERLAY_FRAG = `
 uniform float uVignette, uGrain, uTime;
@@ -31,6 +32,38 @@ void main() {
 }`;
 
 const OVERLAY_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+
+const BACKDROP_FRAG = `
+uniform int uBackdropMode;
+uniform vec3 uBackdropColorA, uBackdropColorB, uBackdropColorC, uBackdropColorD;
+uniform float uBackdropAngle, uBackdropRadius;
+uniform vec2 uBackdropCenter;
+varying vec2 vUv;
+
+void main() {
+  // Work in top-left-oriented frame coordinates. Three's plane UVs run from
+  // bottom to top, while the editor's gradient controls read like a canvas.
+  vec2 p = vec2(vUv.x, 1.0 - vUv.y);
+  vec3 color;
+  if (uBackdropMode == 1) {
+    vec2 dir = vec2(cos(uBackdropAngle), sin(uBackdropAngle));
+    float extent = max(0.0001, 0.5 * (abs(dir.x) + abs(dir.y)));
+    float amount = 0.5 + dot(p - vec2(0.5), dir) / (2.0 * extent);
+    color = mix(uBackdropColorA, uBackdropColorB, clamp(amount, 0.0, 1.0));
+  } else if (uBackdropMode == 2) {
+    float amount = distance(p, uBackdropCenter) / max(0.0001, uBackdropRadius);
+    color = mix(uBackdropColorA, uBackdropColorB, clamp(amount, 0.0, 1.0));
+  } else if (uBackdropMode == 3) {
+    vec3 top = mix(uBackdropColorA, uBackdropColorB, p.x);
+    vec3 bottom = mix(uBackdropColorC, uBackdropColorD, p.x);
+    color = mix(top, bottom, p.y);
+  } else {
+    color = uBackdropColorA;
+  }
+  gl_FragColor = vec4(color, 1.0);
+}`;
+
+const BACKDROP_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
 
 // The mask is evaluated in framebuffer pixels rather than video UV space. A
 // cover-fitted source can extend beyond the frame, but the mask should still
@@ -132,8 +165,30 @@ export class StageRenderer {
     // depth. They are closer than the clear colour and farther than text.
     this.backdropGroup = new THREE.Group();
     this.camera.add(this.backdropGroup);
+    this.backdropColorMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uBackdropMode: { value: 0 },
+        uBackdropColorA: { value: new THREE.Color('#08090c') },
+        uBackdropColorB: { value: new THREE.Color('#08090c') },
+        uBackdropColorC: { value: new THREE.Color('#08090c') },
+        uBackdropColorD: { value: new THREE.Color('#08090c') },
+        uBackdropAngle: { value: 0 },
+        uBackdropRadius: { value: 0.75 },
+        uBackdropCenter: { value: new THREE.Vector2(0.5, 0.5) }
+      },
+      vertexShader: BACKDROP_VERT,
+      fragmentShader: BACKDROP_FRAG,
+      depthTest: false, depthWrite: false, toneMapped: false
+    });
+    this.backdropColorPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), this.backdropColorMat);
+    this.backdropColorPlane.frustumCulled = false;
+    this.backdropColorPlane.renderOrder = -1000;
+    this.backdropGroup.add(this.backdropColorPlane);
     this.backdropMeshes = new Map();
     this.backdropRenderSize = new THREE.Vector2(1, 1);
+    // Scratch vectors for the stage/world conversions the move control asks for.
+    this._probe = new THREE.Vector3();
+    this._origin = new THREE.Vector3();
 
     // The output camera is also an object in the editor scene. A second camera
     // looks at that scene from an oblique angle so the authored text planes,
@@ -322,6 +377,27 @@ export class StageRenderer {
 
   setBackground(hex) { this.renderer.setClearColor(new THREE.Color(hex), 1); }
 
+  _updateBackdropColor(project, time, frameDistance, frameW, frameH) {
+    const value = backdropAt(project, time);
+    const mode = value.mode === 'linear' ? 1 : value.mode === 'radial' ? 2 : value.mode === 'four-point' ? 3 : 0;
+    const uniforms = this.backdropColorMat.uniforms;
+    uniforms.uBackdropMode.value = mode;
+    uniforms.uBackdropColorA.value.set(value.colors[0]);
+    uniforms.uBackdropColorB.value.set(value.colors[1]);
+    uniforms.uBackdropColorC.value.set(value.colors[2]);
+    uniforms.uBackdropColorD.value.set(value.colors[3]);
+    uniforms.uBackdropAngle.value = (Number(value.angle) || 0) * Math.PI / 180;
+    uniforms.uBackdropRadius.value = Number(value.radius) || 0.75;
+    uniforms.uBackdropCenter.value.set(
+      Number.isFinite(Number(value.center?.x)) ? Number(value.center.x) : 0.5,
+      Number.isFinite(Number(value.center?.y)) ? Number(value.center.y) : 0.5
+    );
+
+    this.backdropColorPlane.position.set(0, 0, -frameDistance - 1);
+    this.backdropColorPlane.scale.set(frameW, frameH, 1);
+    this.backdropColorPlane.visible = true;
+  }
+
   _disposeBackdrop(id) {
     const rec = this.backdropMeshes.get(id);
     if (!rec) return;
@@ -354,7 +430,7 @@ export class StageRenderer {
   }
 
   /** Update camera-facing planes for every visual clip in the backdrop lanes. */
-  _updateBackdrops(project, videos, resolution = null) {
+  _updateBackdrops(project, videos, time, resolution = null) {
     // The camera is at positive Z in the normal framing. Keep the plane a
     // little behind the authored scene (world Z < 0), then size it for its
     // actual camera-space distance; a fixed local -10 would otherwise land in
@@ -362,6 +438,7 @@ export class StageRenderer {
     const frameDistance = Math.max(20, Math.abs(this.camera.position.z) + 100);
     const frameH = 2 * Math.tan((FOV / 2) * Math.PI / 180) * frameDistance;
     const frameW = frameH * (project.width / project.height);
+    this._updateBackdropColor(project, time, frameDistance, frameW, frameH);
     const frameAspect = project.width / project.height;
     const renderSize = resolution ?? this.renderer.getDrawingBufferSize(this.backdropRenderSize);
     this._setBackdropResolution(renderSize.x, renderSize.y);
@@ -436,6 +513,41 @@ export class StageRenderer {
 
   /** Force every clip group to be rebuilt on the next frame. */
   invalidate() { for (const g of this.groups.values()) g.key = ''; }
+
+  /**
+   * The laid-out text block of one clip in world units, ignoring whatever the
+   * effect is doing to the glyphs this frame — it describes where the layer is
+   * placed, not where its letters happen to have flown.
+   */
+  clipBounds(id) {
+    const rec = this.groups.get(id);
+    return rec ? { width: rec.layout.width, height: rec.layout.height } : null;
+  }
+
+  /**
+   * Where a world point lands on the stage, in canvas CSS pixels.
+   * Null once the point is behind the output camera.
+   */
+  stagePoint(x, y, z) {
+    const v = this._probe.set(x, y, z).project(this.camera);
+    if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || v.z > 1) return null;
+    const w = this.canvas.clientWidth || this.W;
+    const h = this.canvas.clientHeight || this.H;
+    return { x: (v.x * 0.5 + 0.5) * w, y: (0.5 - v.y * 0.5) * h };
+  }
+
+  /** The world point on the plane z = depth that a stage pixel points at. */
+  stageToWorld(px, py, depth = 0) {
+    const w = Math.max(1, this.canvas.clientWidth || this.W);
+    const h = Math.max(1, this.canvas.clientHeight || this.H);
+    const dir = this._probe.set((px / w) * 2 - 1, -(py / h) * 2 + 1, 0.5).unproject(this.camera);
+    const origin = this.camera.getWorldPosition(this._origin);
+    dir.sub(origin);
+    if (Math.abs(dir.z) < 1e-6) return null;         // looking along the plane
+    const k = (depth - origin.z) / dir.z;
+    if (!(k > 0)) return null;                       // the plane is behind the camera
+    return { x: origin.x + dir.x * k, y: origin.y + dir.y * k };
+  }
 
   _setLinePoints(line, points) {
     const attr = line.geometry.getAttribute('position');
@@ -548,7 +660,9 @@ export class StageRenderer {
 
   _updateEditorCameraScene(cam, project, selection) {
     const p = cam.position;
-    const dist = Math.max(100, p.z);
+    // Draw the frustum at a fixed depth so its size stays constant as the
+    // camera dollies forward or back, instead of collapsing onto the z=0 plane.
+    const dist = defaultCameraPosition(project.width, project.height).z;
     const screenZ = p.z - dist;
     const halfH = dist * Math.tan((FOV / 2) * Math.PI / 180);
     const halfW = halfH * (project.width / project.height);
@@ -615,7 +729,7 @@ export class StageRenderer {
       const pos = clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
-      const active = time >= clip.start && time < clip.end;
+      const active = clipLive(clip, time, project);
       rec.group.visible = active;
       this._applyClip(rec, clip, project, time, beats, active, 1);
     }
@@ -642,7 +756,7 @@ export class StageRenderer {
       const pos = clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
-      const active = time >= clip.start && time < clip.end;
+      const active = clipLive(clip, time, project);
       rec.group.visible = true;
       this._applyClip(rec, clip, project, time, beats, active, active ? 1 : 0.2);
     }
@@ -652,6 +766,8 @@ export class StageRenderer {
     for (const id of [...this.groups.keys()]) this._destroy(id);
     for (const id of [...this.backdropMeshes.keys()]) this._disposeBackdrop(id);
     for (const id of [...this.particleFields.keys()]) this._destroyField(id);
+    this.backdropColorPlane.geometry.dispose();
+    this.backdropColorMat.dispose();
     this.previewTarget.dispose();
     this.renderer.dispose();
   }
@@ -665,8 +781,9 @@ export class StageRenderer {
   }
 
   _clipKey(clip, project, fonts) {
-    return [fonts.map(f => f.__id).join(','), clip.text, clip.size, clip.lineHeight,
-            clip.tracking, clip.align, clip.color, project.depth,
+    const s = clipStyle(clip, project);
+    return [fonts.map(f => f.__id).join(','), clip.text, s.size, s.lineHeight,
+            s.tracking, s.align, s.color, project.depth,
             project.width, project.height].join('|');
   }
 
@@ -676,13 +793,14 @@ export class StageRenderer {
     if (cur && cur.key === key) return cur;
     if (cur) this._destroy(clip.id);
 
+    const style = clipStyle(clip, project);
     const group = new THREE.Group();
     group.userData.clipId = clip.id;
     const glyphs = [];
-    const sizePx = Math.max(4, clip.size * Math.min(project.width, project.height));
+    const sizePx = Math.max(4, style.size * Math.min(project.width, project.height));
     const depth = project.depth || 0;
     const layout = layoutText(fonts, clip.text, sizePx, {
-      lineHeight: clip.lineHeight, tracking: clip.tracking, align: clip.align
+      lineHeight: style.lineHeight, tracking: style.tracking, align: style.align
     });
 
     for (const item of layout.items) {
@@ -690,11 +808,11 @@ export class StageRenderer {
       const geo = glyphGeometry(item.font, item.glyph, sizePx, depth);
       if (!geo.geometry) continue;
       const material = depth > 0
-        ? new THREE.MeshStandardMaterial({ color: clip.color, roughness: 0.42, metalness: 0.08, transparent: true })
+        ? new THREE.MeshStandardMaterial({ color: style.color, roughness: 0.42, metalness: 0.08, transparent: true })
         // depthFunc LessDepth rejects coplanar re-draws, so overlapping strokes
         // inside one glyph never double-blend while the glyph fades.
         : new THREE.MeshBasicMaterial({
-            color: clip.color, transparent: true, side: THREE.DoubleSide,
+            color: style.color, transparent: true, side: THREE.DoubleSide,
             depthWrite: true, depthFunc: THREE.LessDepth
           });
       const mesh = new THREE.Mesh(geo.geometry, material);
@@ -798,12 +916,17 @@ export class StageRenderer {
     }
     const pulse = animate && beats?.length ? Math.exp(-sinceBeat * 9) * react : 0;
     const dur = Math.max(1e-4, clip.end - clip.start);
-    const u = animate ? clamp((time - clip.start) / dur, 0, 1) : 0.5;
-    const p = resolveParams(clip.effect, clip.params);
+    // One stage is live at a time: it hands its own effect the slice of that
+    // effect's arc the stage stands for, stretched over the stage's length.
+    const at = stageAt(clip, time);
+    const stage = clipStage(clip, at.key);
+    const u = animate ? stageU(stage.effect, at.key, at.local) : 0.5;
+    const p = resolveParams(stage.effect, stage.params);
     const n = rec.glyphs.length;
     const c = {
       i: 0, n, u, t: animate ? time - clip.start : dur * 0.5, time, pulse, react,
-      sinceBeat, beatIndex, p, W: project.width, H: project.height, size: rec.sizePx, clip
+      sinceBeat, beatIndex, p, W: project.width, H: project.height, size: rec.sizePx,
+      stage: at.key, clip
     };
 
     for (let i = 0; i < n; i++) {
@@ -815,7 +938,7 @@ export class StageRenderer {
         opacity: 1
       };
       c.i = i;
-      if (animate) applyEffect(clip.effect, g, c);
+      if (animate) applyEffect(stage.effect, g, c);
 
       gl.mesh.position.set(g.x, g.y, g.z);
       gl.mesh.rotation.set(g.rx, g.ry, g.rz);
@@ -850,7 +973,7 @@ export class StageRenderer {
     const far = Math.max(40000, Math.abs(cam.position.z) * 4, project.width * 20, project.height * 20);
     if (this.camera.far !== far) { this.camera.far = far; this.camera.updateProjectionMatrix(); }
     this.camera.updateMatrixWorld(true);
-    this._updateBackdrops(project, videos);
+    this._updateBackdrops(project, videos, time);
 
     const inSpace = this.mode === 'space';
     this.canvas.style.cursor = inSpace ? 'grab' : 'default';
@@ -863,7 +986,10 @@ export class StageRenderer {
       this._updateEditorCameraScene(cam, project, selection);
     }
 
-    const stack = (fonts ?? []).filter(Boolean);
+    // `fonts` is slot-aligned so a layer can name the face it leads with; the
+    // filtered copy only answers "is there any typeface at all yet".
+    const slots = fonts ?? [];
+    const stack = slots.filter(Boolean);
 
     // Drop groups for clips that no longer exist.
     const live = new Set(clips.map(c => c.id));
@@ -872,7 +998,7 @@ export class StageRenderer {
 
     // Higher track index renders further back, so track 0 sits in front.
     const active = clips
-      .filter(c => time >= c.start && time < c.end)
+      .filter(c => clipLive(c, time, project))
       .sort((a, b) => b.track - a.track);
     const draw = inSpace
       ? [...clips].sort((a, b) => b.track - a.track || a.start - b.start)
@@ -881,12 +1007,12 @@ export class StageRenderer {
     let glyphCount = 0;
     for (const clip of draw) {
       if (!stack.length) continue;
-      const rec = this._group(clip, project, stack);
+      const rec = this._group(clip, project, orderFonts(slots, clipStyle(clip, project).font));
       rec.group.visible = true;
       const pos = clip.position ?? { x: 0, y: 0, z: 0 };
       rec.group.position.set(Number(pos.x) || 0, Number(pos.y) || 0, Number(pos.z) || 0);
       rec.group.renderOrder = 10 - clip.track;
-      const isActive = time >= clip.start && time < clip.end;
+      const isActive = clipLive(clip, time, project);
       this._applyClip(rec, clip, project, time, beats, isActive, inSpace && !isActive ? 0.2 : 1);
       if (isActive) glyphCount += rec.glyphs.length;
     }

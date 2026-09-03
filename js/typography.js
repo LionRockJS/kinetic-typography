@@ -27,6 +27,18 @@ export const FONT_PRESETS = [
     url: 'https://cdn.jsdelivr.net/npm/@fontsource/playfair-display@5.0.20/files/playfair-display-latin-700-normal.woff' }
 ];
 
+/**
+ * The stack a layer draws with: the face it leads with, then the rest as
+ * fallback, so a Latin display face can front the layer while the CJK face
+ * still picks up 起承轉合. Empty slots drop out.
+ */
+export function orderFonts(slots, lead = 0) {
+  const list = slots ?? [];
+  const i = Math.trunc(Number(lead) || 0);
+  const head = list[i] ? [list[i]] : [];
+  return [...head, ...list.filter((f, k) => f && k !== i)];
+}
+
 let fontSerial = 0;
 
 export async function parseFont(arrayBuffer, name = 'font') {

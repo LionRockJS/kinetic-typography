@@ -1,17 +1,21 @@
 // Bootstrap: wires the store, the three.js stage, the timeline and the panels together.
 
-import { state, clips, track, audioClips, audioClip, addAudioClip, removeAudioClip,
+import { state, clips, track, audioClips, savedAudioClips, audioClip, addAudioClip, removeAudioClip,
          initProject, on, emit, setTime, setDuration,
-         syncBeatTimes, beatTimes, setMetro, setFont, fontStack, fontsReady, select,
+         syncBeatTimes, beatTimes, setMetro, setFont, fontSlots, fontsReady, select,
          selectCameraKey,
          videoChannels, videoChannel, videoClips, videoClip, addVideoClip,
          removeVideoClip, makeVideoChannel } from './state.js';
+import { initHistory } from './history.js';
+import { readAutosave, restoreAutosave, startAutosave } from './autosave.js';
 import { StageRenderer } from './renderer.js';
+import { StageGizmo } from './gizmo.js';
 import { Timeline } from './timeline.js';
 import { AudioEngine, analyze, waveformPeaks, TRACK_KINDS } from './audio/engine.js';
 import { analyzeSpeech } from './audio/speech.js';
 import { VideoEngine, VIDEO_CHANNEL_KINDS } from './video/engine.js';
 import { Metronome } from './audio/metronome.js';
+import { rememberMedia, recallMedia } from './media/store.js';
 import { Recorder } from './export.js';
 import { FONT_PRESETS, loadFontFromUrl, loadFontFromFile } from './typography.js';
 import { initUI, setAudioProgress, syncPlayButton } from './ui.js';
@@ -22,6 +26,7 @@ const renderer = new StageRenderer(canvas);
 const engine = new AudioEngine();
 const videoEngine = new VideoEngine();
 const timeline = new Timeline($('#timelineCanvas'), $('#tlTip'));
+const gizmo = new StageGizmo(renderer);
 const recorder = new Recorder(canvas, engine);
 const metro = new Metronome(engine);
 
@@ -82,7 +87,7 @@ function audioInsertStart(kind, duration) {
 
 /** Import a file into one of the three lanes. Music gets beat analysis; VO can
  * be sent through the separate word-timing pass from its lane controls. */
-async function importAudio(file, kind = 'bgm') {
+async function importAudio(file, kind = 'bgm', attachId = null, { handle = null, quiet = false } = {}) {
   const tr = kind === 'bgm' ? track('bgm') : null;
   let clip = null;
   let createdClip = false;
@@ -91,18 +96,25 @@ async function importAudio(file, kind = 'bgm') {
     const { buffer, mono, sampleRate } = await engine.decode(file);
 
     const props = {
-      name: file.name, duration: buffer.duration, ready: true,
+      name: file.name, size: file.size, duration: buffer.duration, ready: true,
       peaks: waveformPeaks(mono, 2048)
     };
+    // Keep the bytes (and the handle, where the browser has one) so the next
+    // Open can attach this source without sending the user back to the dialog.
+    rememberMedia(file, { duration: buffer.duration, handle })
+      .catch(err => console.warn('Could not cache media', err));
 
     if (kind === 'bgm') {
       engine.setBuffer(kind, buffer);
       Object.assign(tr, props);
     } else {
       // Opening a project restores reference-only VO/SFX clips as pending.
-      // Re-importing the same filename should attach to that saved clip so
-      // its timing and mix settings survive, rather than creating a duplicate.
-      clip = audioClips(kind).find(saved => !saved.ready && saved.name === file.name) ?? null;
+      // Attaching from a saved clip's own button targets it by id; otherwise a
+      // matching filename attaches to the saved clip so its timing and mix
+      // settings survive, rather than creating a duplicate.
+      clip = (attachId ? audioClips(kind).find(saved => saved.id === attachId) : null)
+        ?? audioClips(kind).find(saved => !saved.ready && saved.name === file.name)
+        ?? null;
       if (!clip) {
         clip = addAudioClip(kind, { ...props, start: audioInsertStart(kind, buffer.duration) }, { notify: false });
         createdClip = true;
@@ -122,19 +134,21 @@ async function importAudio(file, kind = 'bgm') {
         onsetStrength: Array.from(result.onsetStrength ?? []),
         envelope: result.envelope,
         bpm: result.bpm,
-        offset: 0
+        // Reattaching a project's own music re-derives the grid, but the offset
+        // and click-track settings it was saved with are the user's, not ours.
+        ...(quiet ? {} : { offset: 0 })
       });
-      setMetro({ source: 'track', bpm: result.bpm });
+      if (!quiet) setMetro({ source: 'track', bpm: result.bpm });
       syncBeatTimes();
-      toast(`${result.bpm.toFixed(1)} BPM · ${result.beats.length} beats · ${state.audio.hits.length} peaks`);
-    } else {
+      if (!quiet) toast(`${result.bpm.toFixed(1)} BPM · ${result.beats.length} beats · ${state.audio.hits.length} peaks`);
+    } else if (!quiet) {
       toast(`${kind.toUpperCase()}: ${file.name} · ${fmtDur(buffer.duration)} · added to lane`);
     }
 
     setAudioProgress(1.1, '');
     emit('audio', state.audio);
 
-    if (kind === 'bgm' && firstAudio && Math.abs(buffer.duration - state.project.duration) > 0.5) {
+    if (kind === 'bgm' && firstAudio && !quiet && Math.abs(buffer.duration - state.project.duration) > 0.5) {
       setDuration(buffer.duration, { scale: true });
       timeline.fit();
     }
@@ -149,7 +163,9 @@ async function importAudio(file, kind = 'bgm') {
     }
     setAudioProgress(-1, '');
     toast(`Could not read that ${kind.toUpperCase()} file`);
+    return false;
   }
+  return true;
 }
 
 /** Run local Whisper on one loaded VO clip and keep its timings relative to the source. */
@@ -244,7 +260,7 @@ function videoInsertStart(kind, duration) {
   return clamp(Math.max(state.ui.time, end), -duration, state.project.duration);
 }
 
-async function importVideo(file, kind = 'v1', replaceId = null) {
+async function importVideo(file, kind = 'v1', replaceId = null, { handle = null, quiet = false } = {}) {
   let clip = replaceId ? videoClip(kind, replaceId) : null;
   let createdClip = false;
   try {
@@ -261,8 +277,11 @@ async function importVideo(file, kind = 'v1', replaceId = null) {
     if (!clip) throw new Error(`Unknown backdrop lane: ${kind}`);
 
     const { duration } = await videoEngine.load(kind, clip.id, file);
+    rememberMedia(file, { duration, handle })
+      .catch(err => console.warn('Could not cache media', err));
     Object.assign(clip, {
       name: file.name,
+      size: file.size,
       duration,
       start: clamp(clip.start, -duration, state.project.duration),
       inDuration: clamp(Number(clip.inDuration) || 0, 0, duration),
@@ -273,8 +292,10 @@ async function importVideo(file, kind = 'v1', replaceId = null) {
     emit('video', state.video);
     timeline.draw();
     dirty = true;
-    const short = VIDEO_CHANNEL_KINDS.find(v => v.kind === kind)?.short ?? kind;
-    toast(`${short}: ${file.name} · ${fmtDur(duration)} · added to lane`);
+    if (!quiet) {
+      const short = VIDEO_CHANNEL_KINDS.find(v => v.kind === kind)?.short ?? kind;
+      toast(`${short}: ${file.name} · ${fmtDur(duration)} · added to lane`);
+    }
   } catch (err) {
     console.error(err);
     if (clip && createdClip) {
@@ -282,7 +303,52 @@ async function importVideo(file, kind = 'v1', replaceId = null) {
       removeVideoClip(kind, clip.id);
     }
     toast('Could not read that video file');
+    return false;
   }
+  return true;
+}
+
+/**
+ * Reattach the media a freshly opened project points at. Sources cached by an
+ * earlier session come back silently; those that survive only as a file handle
+ * need the user's permission, so they are counted and left for the ↗ button.
+ */
+async function relinkSavedMedia() {
+  const pending = [];
+  for (const { kind } of TRACK_KINDS) {
+    for (const clip of savedAudioClips(kind)) {
+      if (!clip.ready && clip.name) pending.push({ media: 'audio', kind, clip });
+    }
+  }
+  for (const { kind } of VIDEO_CHANNEL_KINDS) {
+    for (const clip of [...videoClips(kind)]) {
+      if (!clip.ready && clip.name) pending.push({ media: 'video', kind, clip });
+    }
+  }
+
+  let attached = 0;
+  let needsPermission = 0;
+  // One at a time: decoding several sources at once only fights for the same
+  // audio context and video elements.
+  for (const { media, kind, clip } of pending) {
+    const found = await recallMedia(clip).catch(() => null);
+    if (found?.file) {
+      const ok = media === 'audio'
+        ? await importAudio(found.file, kind, clip.id, { quiet: true })
+        : await importVideo(found.file, kind, clip.id, { quiet: true });
+      if (ok) attached++;
+    } else if (found?.needsPermission) {
+      needsPermission++;
+    }
+  }
+
+  if (attached) {
+    emit('audio', state.audio);
+    emit('video', state.video);
+    timeline.draw();
+    dirty = true;
+  }
+  return { pending: pending.length, attached, needsPermission };
 }
 
 function clearVideo(kind = 'v1', id = null) {
@@ -372,8 +438,9 @@ async function toggleRecord() {
     pause();
     if (blob) {
       const name = (state.project.name || 'composition').replace(/[^\w\-. ]+/g, '_');
-      download(`${name}.webm`, blob);
-      toast('Recording saved');
+      const ext = Recorder.extFor(blob.type);
+      download(`${name}.${ext}`, blob);
+      toast(`Recording saved as ${ext.toUpperCase()}`);
     }
     return;
   }
@@ -427,7 +494,7 @@ function frame() {
       time: state.ui.time,
       project: state.project,
       clips: clips(),
-      fonts: fontStack(),
+      fonts: fontSlots(),
       videos: { channels: videoChannels(), runtime: videoEngine.channels },
       beats: beatTimes().length ? beatTimes() : null,
       mode: state.ui.recording ? 'output' : state.ui.viewMode,
@@ -435,22 +502,32 @@ function frame() {
     });
     dirty = false;
   }
+
+  // The move control is projected through the camera of the frame just drawn,
+  // so it is refreshed after the render rather than from the event bus.
+  gizmo.sync();
 }
 
 // ══ boot ═════════════════════════════════════════════════════
 async function boot() {
   initProject();
+  // A session that ended badly — a crash, a closed tab, a reload — comes back
+  // where it left off instead of at the demo arrangement.
+  const recovered = restoreAutosave(readAutosave());
+  // Whatever is on screen now is the floor of the undo stack, not a step in it.
+  initHistory();
 
   initUI({
     engine, timeline, renderer,
     togglePlay, play, pause, seek, playRange,
     importAudio, analyzeVoice, clearAudio, loadFontUrl, loadFontFile, clearFont, toggleRecord,
-    importVideo, clearVideo, clearVideos,
+    importVideo, clearVideo, clearVideos, relinkSavedMedia,
     syncMetro, setMetroEnabled
   });
 
-  on('render time fonts audio guides clips clip audioMove video videoMove videoLevel view', () => { dirty = true; });
+  on('render time fonts audio guides clips clip audioMove video videoMove videoLevel backdrop view', () => { dirty = true; });
   on('seek', t => seek(t));
+  on('pause', pause);
 
   // Keep every decoded source aligned with the state. VO and SFX may have
   // several clips, so the runtime source is addressed by its clip id.
@@ -488,7 +565,10 @@ async function boot() {
     timeline.draw();
   });
   on('grid metro', syncMetro);
-  on('project duration guides clips clip', () => { dirty = true; timeline.draw(); });
+  on('project duration guides clips clip backdrop particles', () => { dirty = true; timeline.draw(); });
+  // Selection moves the highlight between lanes — the emitter blocks have to
+  // repaint even when nothing about the project itself changed.
+  on('selection', () => { timeline.draw(); });
   on('project', fitViewport);
   on('duration', () => { timeline.draw(); });
   window.addEventListener('resize', () => { fitViewport(); timeline.resize(); });
@@ -502,14 +582,44 @@ async function boot() {
   const splash = $('#boot');
   // A Latin display face up front, a CJK face behind it — the stack in miniature.
   const defaults = ['inter-700', 'noto-tc-700'];
+  // A recovered session brings its typefaces back as far as they can come: a
+  // preset reloads from its URL, a font file the user supplied cannot, so that
+  // slot falls back to the default rather than leaving the stage blank.
+  const savedPresets = recovered?.fonts?.some(f => f?.preset)
+    ? recovered.fonts.map(f => f?.preset ?? null)
+    : null;
+  const wanted = [...(savedPresets ?? defaults)];
+  if (!wanted[0]) wanted[0] = defaults[0];
   $('#bootMsg').textContent = 'loading typefaces…';
-  for (let i = 0; i < defaults.length; i++) {
-    const preset = FONT_PRESETS.find(f => f.id === defaults[i]);
+  for (let i = 0; i < wanted.length; i++) {
+    const preset = FONT_PRESETS.find(f => f.id === wanted[i]);
     if (preset) await loadFontUrl(preset, i);
   }
   if (!fontsReady()) $('#bootMsg').textContent = 'typeface unavailable — load one from the panel';
   splash.style.opacity = '0';
   setTimeout(() => splash.remove(), 500);
+
+  // Media is a reference in the snapshot, exactly as it is in a saved file, so
+  // recovery finishes the same way opening a project does — through the cache.
+  if (recovered) {
+    const { pending = 0, attached = 0 } = await relinkSavedMedia();
+    const media = !pending ? ''
+      : attached === pending ? ` · ${attached} media file${attached === 1 ? '' : 's'} reattached`
+      : ` · ${pending - attached} media file${pending - attached === 1 ? '' : 's'} to re-import`;
+    toast(`Recovered your last session from ${timeAgo(recovered.savedAt)}${media}`, 4200);
+  }
+  // Only now: a snapshot taken mid-boot would record a project without fonts.
+  startAutosave();
+}
+
+/** How long ago the recovered snapshot was written, in words. */
+function timeAgo(at) {
+  const s = at ? Math.max(0, (Date.now() - at) / 1000) : 0;
+  if (!at || s < 90) return 'a moment ago';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) { const h = Math.round(s / 3600); return `${h} hour${h === 1 ? '' : 's'} ago`; }
+  const d = Math.round(s / 86400);
+  return `${d} day${d === 1 ? '' : 's'} ago`;
 }
 
 boot();

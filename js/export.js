@@ -1,5 +1,6 @@
-// Real-time WebM capture: the stage canvas is already rendered at the project's
-// true pixel size, so the recording is 1:1 with the composition.
+// Real-time video capture: the stage canvas is already rendered at the project's
+// true pixel size, so the recording is 1:1 with the composition. MP4/H.264 is
+// preferred where the browser can mux it (Safari, Chrome 130+); WebM elsewhere.
 
 export class Recorder {
   constructor(canvas, engine) {
@@ -16,12 +17,22 @@ export class Recorder {
 
   static mime() {
     const list = [
+      // MP4 first — plays anywhere without a transcode step.
+      'video/mp4;codecs=avc1.640033,mp4a.40.2',
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4;codecs=avc1',
+      'video/mp4',
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
       'video/webm;codecs=vp9',
       'video/webm'
     ];
     return list.find(m => MediaRecorder.isTypeSupported(m)) ?? '';
+  }
+
+  // File extension matching whatever the browser actually produced.
+  static extFor(type = '') {
+    return type.includes('mp4') ? 'mp4' : 'webm';
   }
 
   start(fps = 30) {

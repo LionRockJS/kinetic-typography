@@ -100,3 +100,17 @@ input[type="number"] { -moz-appearance: textfield; }
 }
 
 #stageCanvas { touch-action: none; }
+
+/* ── stage move control ──────────────────────────────────── */
+#stageGizmo.hidden { display: none; }
+.gz-box {
+  fill: rgba(56, 189, 248, 0.05); stroke: #38bdf8; stroke-width: 1.25;
+  stroke-dasharray: 5 4; pointer-events: auto; cursor: move;
+}
+.gz-box:hover { fill: rgba(56, 189, 248, 0.10); }
+.gz-corner { fill: #0d0f14; stroke: #38bdf8; stroke-width: 1.25; }
+.gz-cross { stroke: #0d0f14; stroke-width: 1.5; opacity: .8; }
+.gz-handle { fill: rgba(56, 189, 248, .92); stroke: #0d0f14; stroke-width: 2; pointer-events: auto; cursor: grab; }
+.gz-handle:hover { fill: #7dd3fc; }
+#stageGizmo.is-dragging .gz-box { stroke-dasharray: none; fill: rgba(56, 189, 248, 0.12); cursor: grabbing; }
+#stageGizmo.is-dragging .gz-handle { fill: #7dd3fc; cursor: grabbing; }

@@ -26,7 +26,7 @@ the optional speech runtime/model only when VO analysis is requested.
 | Peaks | transient detection with spacing and sensitivity thresholds, snappable |
 | Metronome | synthesised click bus, 3 voices, track-follow or manual BPM with tap tempo |
 | Typography | 3-slot fallback stack, browser-measured kerning, CJK-correct counters |
-| Export | real-time WebM capture, `.ktc.json` project save/load |
+| Export | real-time MP4 capture (WebM fallback), `.ktc.json` project save/load |
 
 **Measured accuracy.** Tempo detection was checked against synthetic click
 tracks at 90 / 120 / 140 BPM and returned 89.97 / 120.07 / 140.01 BPM with the
@@ -335,6 +335,7 @@ used for full-size preview and recording.
 
 Keys: `space` play · `←/→` step a frame (`⇧` ten) · `↑/↓` select layer ·
 `[` `]` jump to in/out · `n` new layer · `k` camera key · `m` metronome ·
+`⌘Z` undo · `⌘⇧Z` redo ·
 `⌘D` duplicate · `⌘C` copy · `⌘V` paste at the playhead · `⌫` delete · `f` fit · `l` loop.
 
 Copy/paste uses the system clipboard when available and keeps an in-app
@@ -417,7 +418,9 @@ jsDelivr) or your own `.ttf` / `.otf` / `.woff`.
 
 ## Export
 
-**Record** captures the canvas in real time to WebM, with the music muxed in.
+**Record** captures the canvas in real time, with the music muxed in. The file is
+MP4 (H.264) where the browser can mux it — Safari and Chrome 130+ — and WebM
+otherwise (Firefox). The saved extension always matches the actual format.
 The canvas is always rendered at the project's true pixel size, so the recording
 is 1:1 with the composition.
 
@@ -426,6 +429,54 @@ are saved, while the source files are referenced by name rather than embedded �
 reload each source after opening a project.
 
 ---
+
+## Undo and redo
+
+`Undo` / `Redo` in the top bar, `⌘Z` / `⌘⇧Z` (`⌘Y` also redoes). Each button
+names the step it will reverse — *Undo delete layer*, *Undo add camera key* —
+so it is clear what is about to move before it moves.
+
+**A gesture is one step, not one step per pixel.** Dragging a layer the width of
+the timeline, sweeping a slider, or typing a line of text each undo in a single
+press: a change waits for the pointer to come up and the keystrokes to stop
+before it becomes an entry. A discrete action — a button, a keyboard shortcut —
+becomes an entry immediately, so two quick presses stay two separate steps.
+
+**Undo covers the composition, not the media.** Everything in the project file —
+structure, layers, camera, particles, size, duration, look — is on the stack.
+Importing or removing audio and backdrop video is not, because the browser owns
+those decoded buffers and no snapshot can conjure them back. The trade is
+deliberate: undoing a text edit can never silently detach a soundtrack. Opening
+a project starts a fresh history, as does loading the app.
+
+Undoing a delete restores the selection along with the layer, so the thing that
+came back is the thing that is selected.
+
+## Autosave and recovery
+
+The composition is written to `localStorage` whenever the editing goes quiet —
+about a second after the last change, and at least every eight seconds through a
+long unbroken gesture — and again when the tab is hidden or closed. Reopening
+the app restores that snapshot instead of the demo arrangement, so a crashed
+tab, a stray `⌘W` or a reload costs nothing. A toast says what came back and how
+old it was.
+
+It is deliberately the *same document* `Save` writes: one serializer, one reader,
+one set of migrations, and a snapshot written by a newer build is left alone
+rather than opened half-understood. That also means it holds media the same way
+a project file does — as references — so recovery finishes exactly as opening a
+file does, by pulling the bytes back out of the local media cache. Typefaces
+come back as far as they can: a preset reloads from its URL, a font file the
+user supplied cannot, and that slot falls back to the default.
+
+The recovered project is the floor of the undo stack, not a step in it — undo
+cannot rewind past the recovery into the demo arrangement. `New` in the top bar
+is the way back to an empty composition: it discards the current one, the
+autosave included, and asks first because nothing else undoes it.
+
+With no usable `localStorage` — a private window, blocked storage, a page opened
+over `file://` — or when the quota is full, autosave says so once and the app
+runs exactly as it did before, minus the recovery.
 
 ## Project file
 
@@ -560,6 +611,8 @@ serve.py                   dev server: no-cache headers, correct MIME types
 css/app.css                chrome Tailwind does not cover
 js/main.js                 bootstrap, transport, frame loop
 js/state.js                project store + event bus
+js/history.js              undo / redo — project snapshots, one per gesture
+js/autosave.js             crash recovery — the project kept in localStorage
 js/structure.js            起承轉合 levels, guides, pattern, weighting
 js/camera.js               keyframed camera track
 js/effects.js              the effect library
@@ -568,7 +621,7 @@ js/renderer.js             three.js stage, compositing
 js/timeline.js             canvas timeline, all editing gestures
 js/ui.js                   panel wiring
 js/util.js                 maths, easing, formatting, DOM helpers
-js/export.js               WebM capture
+js/export.js               MP4 / WebM capture
 js/audio/engine.js         three-lane playback, transport clock, worker hand-off
 js/audio/metronome.js      synthesised click bus + manual tempo grid
 js/audio/analyzer.worker.js  FFT, onsets, tempo, beat grid

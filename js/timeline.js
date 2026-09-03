@@ -16,18 +16,32 @@
 //   drag the animation ends   → move / stretch the animation arc
 //   drag the end cap          → stretch the whole composition (⌥ keeps positions)
 //   drag a clip               → move it (up/down changes track)
+//   ⌘/ctrl-click a clip       → add or remove it from the selection; a drag
+//                               then moves every selected layer together
+//   ⇧-click a clip            → extend the selection to it (⇧ while dragging
+//                               still means "ignore snapping")
 //   drag a clip edge          → trim it
+//   drag a stage handle       → set how long the selected layer's in or out
+//                               stage runs; mid keeps the rest
+//   drag a particle block     → move its live window · drag an edge to trim
 //   double-click a track      → new clip in that phase
 //   drag the ruler            → scrub · hold ⇧ while scrubbing → snap · ⇧ edits → no snap
 
-import { state, level, guides, clips, audioClips, audioClip, anyAudio, videoClips, videoClip, anyVideo, camera, cameraKeys,
+import { state, level, guides, clips, audioClips, savedAudioClips, audioClip, anyAudio, videoClips, videoClip, anyVideo, camera, cameraKeys,
          cameraMode, cameraChannelKeys, selectCameraKey, select, selectGuide,
+         selectCameraTrack,
          selectGuidesInRange, selectedGuideIds, selectedGuideIndices, setDuration,
+         selectClip, selectedClipIds, selectedClips,
          commitClips, commitGuides, commitCameraKeys, addClip, addCameraKey, addCameraChannelKey,
          updateCameraKey, updateCameraChannelKey,
          setRunPivot, runPivotIndex, setAudioClipStart, setVideoClipStart, beatTimes, barTimes,
          voiceWordTimes,
+         particleEmitters, particleEmitter, selectEmitter, activeEmitterId, addParticleEmitter,
+         setEmitterWindow, commitEmitters, setStageDuration,
+         backdrop, backdropKeys, backdropKey, selectBackdropKey, selectBackdropTrack,
+         addBackdropKey, updateBackdropKey, commitBackdropKeys, backdropAt, sampleBackdrop,
          emit, TRACKS, MIN_CLIP } from './state.js';
+import { stageWindows } from './effects.js';
 import { TRACK_KINDS } from './audio/engine.js';
 import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
 import { ROLES, LEVELS, LEVEL_KEYS, guideDisplay, guideHandles, drivingRegion, headIsCombined,
@@ -45,6 +59,8 @@ const LANE = {
   camera:    [112, 184],
   overall:   [188, 212],
   animation: [214, 238],
+  backdrop:  [242, 274],
+  particles: [318, 338],
   v1:    [340, 366],
   v2:    [368, 394],
   v3:    [396, 422]
@@ -70,8 +86,16 @@ const CAMERA_AXIS_META = {
 let TRACK_TOP = 244;
 const TRACK_H = 26;
 const TRACK_GAP = 4;
+const PARTICLE_H = 20;
+const PARTICLE_GAP = 2;
 const HIT = 14;
 const EDGE = 7;
+const STAGE_EDGE = 4;         // grab radius of an in/out stage handle
+const BACKDROP_KEY_HIT = 9;
+
+/** in › mid › out on the block, collapsed to one word when they agree. */
+const stageNames = c =>
+  [...new Set(['in', 'mid', 'out'].map(k => c.stages?.[k]?.effect ?? '–'))].join(' › ');
 
 export let TIMELINE_HEIGHT = 0;
 
@@ -130,10 +154,19 @@ export class Timeline {
     setCameraRow('y', 25, 22);
     setCameraRow('z', 48, 22);
 
-    y = setLane('overall', y + 4, 24) + 2;
+    y = setLane('backdrop', y + 4, 32) + 4;
+    y = setLane('overall', y, 24) + 2;
     y = setLane('animation', y, 24) + 6;
     TRACK_TOP = y;
     y += TRACKS * TRACK_H + Math.max(0, TRACKS - 1) * TRACK_GAP;
+
+    // One row per emitter, so overlapping live windows stay readable.
+    hideLane('particles');
+    const emitters = particleEmitters().length;
+    if (emitters) {
+      y += 8;
+      y = setLane('particles', y, emitters * PARTICLE_H + (emitters - 1) * PARTICLE_GAP);
+    }
 
     for (const kind of VIDEO_LANES) hideLane(kind);
     if (hasVideo) {
@@ -157,6 +190,12 @@ export class Timeline {
   t(x) { return this.view.start + (x / this.w) * this.span; }
   get pxPerSec() { return this.w / this.span; }
   trackTop(i) { return TRACK_TOP + i * (TRACK_H + TRACK_GAP); }
+  particleRowTop(i) { return (LANE.particles?.[0] ?? 0) + i * (PARTICLE_H + PARTICLE_GAP); }
+  particleRowAt(py) {
+    if (!LANE.particles) return -1;
+    const i = Math.floor((py - LANE.particles[0]) / (PARTICLE_H + PARTICLE_GAP));
+    return i >= 0 && i < particleEmitters().length ? i : -1;
+  }
   trackAt(y) {
     const i = Math.floor((y - TRACK_TOP) / (TRACK_H + TRACK_GAP));
     return i >= 0 && i < TRACKS ? i : -1;
@@ -230,8 +269,9 @@ export class Timeline {
       const beat = nearest(beatTimes(), t, px * 0.7);
       if (beat !== null) return { t: beat, kind: 'beat' };
     }
+    const skip = new Set(Array.isArray(exceptClip) ? exceptClip : exceptClip ? [exceptClip] : []);
     const edges = [];
-    for (const c of clips()) if (c.id !== exceptClip) edges.push(c.start, c.end);
+    for (const c of clips()) if (!skip.has(c.id)) edges.push(c.start, c.end);
     edges.push(0, state.project.duration);
     const e = nearest(edges.sort((x, y) => x - y), t, px * 0.6);
     if (e !== null) return { t: e, kind: 'edge' };
@@ -239,6 +279,21 @@ export class Timeline {
   }
 
   // ── hit testing ────────────────────────────────────────────
+  /**
+   * Which stage boundary is under the pointer, if any. Only the layer the
+   * inspector is editing offers them, so a plain click on any other layer still
+   * grabs the block itself.
+   */
+  _stageHandleAt(c, px) {
+    const sel = state.ui.sel;
+    if (c.locked || !(sel?.type === 'clip' && sel.id === c.id)) return null;
+    if (this.x(c.end) - this.x(c.start) < 26) return null;
+    const ws = stageWindows(c);
+    if (Math.abs(px - this.x(ws[0].end)) <= STAGE_EDGE) return 'in';
+    if (Math.abs(px - this.x(ws[1].end)) <= STAGE_EDGE) return 'out';
+    return null;
+  }
+
   hitTest(px, py) {
     if (this._syncLayout() && this.h > 0) this.resize();
     for (const key of LEVEL_KEYS) {
@@ -271,8 +326,9 @@ export class Timeline {
         const c = list[i];
         const x0 = this.x(c.start), x1 = this.x(c.end);
         if (px >= x0 - 2 && px <= x1 + 2) {
-          const edge = px - x0 <= EDGE ? 'start' : x1 - px <= EDGE ? 'end' : null;
-          return { type: 'clip', id: c.id, edge, track: trackIndex };
+          const edge = c.locked ? null : px - x0 <= EDGE ? 'start' : x1 - px <= EDGE ? 'end' : null;
+          const stage = edge ? null : this._stageHandleAt(c, px);
+          return { type: 'clip', id: c.id, edge, stage, track: trackIndex, locked: !!c.locked };
         }
       }
       return { type: 'track', track: trackIndex, t };
@@ -289,6 +345,33 @@ export class Timeline {
           }
         }
         return { type: 'cameraLane', axis, t: this.t(px) };
+      }
+    }
+    if (LANE.particles) {
+      const [y0, y1] = LANE.particles;
+      if (py >= y0 && py <= y1) {
+        const row = this.particleRowAt(py);
+        const e = row >= 0 ? particleEmitters()[row] : null;
+        if (e) {
+          const x0 = this.x(e.start), x1 = this.x(e.end);
+          if (px >= x0 - 2 && px <= x1 + 2) {
+            const edge = px - x0 <= EDGE ? 'start' : x1 - px <= EDGE ? 'end' : null;
+            return { type: 'particle', id: e.id, edge, row };
+          }
+        }
+        return { type: 'particleLane', t: this.t(px) };
+      }
+    }
+    {
+      const [y0, y1] = LANE.backdrop;
+      if (py >= y0 && py <= y1) {
+        const keys = backdropKeys();
+        for (let i = keys.length - 1; i >= 0; i--) {
+          if (Math.abs(px - this.x(keys[i].t)) <= BACKDROP_KEY_HIT) {
+            return { type: 'backdropkey', id: keys[i].id };
+          }
+        }
+        return { type: 'backdropLane', t: this.t(px) };
       }
     }
     for (const kind of VIDEO_LANES) {
@@ -342,6 +425,8 @@ export class Timeline {
   onDown(e) {
     const { px, py } = this._pos(e);
     const hit = this.hitTest(px, py);
+    // Any timeline interaction pauses playback before it starts editing or scrubbing.
+    emit('pause');
     this.canvas.setPointerCapture(e.pointerId);
 
     if (hit.type === 'guide') {
@@ -386,7 +471,7 @@ export class Timeline {
         levels: Object.fromEntries(LEVEL_KEYS.map(k => [k, {
           start: level(k).start, end: level(k).end, guides: guides(k).map(g => g.t)
         }])),
-        clips: clips().map(c => ({ start: c.start, end: c.end }))
+        clips: clips().map(c => ({ start: c.start, end: c.end, locked: !!c.locked }))
       };
     } else if (hit.type === 'camkey') {
       if (hit.axis) {
@@ -397,6 +482,21 @@ export class Timeline {
       const keys = hit.axis ? cameraChannelKeys(hit.axis) : cameraKeys();
       const k = keys.find(x => x.id === hit.id);
       this.drag = { type: 'camkey', id: hit.id, axis: hit.axis, grab: this.t(px) - k.t };
+    } else if (hit.type === 'cameraLane') {
+      selectCameraTrack();
+      this.drag = { type: 'scrub' };
+      const raw = this.t(px);
+      emit('seek', e.shiftKey ? this.snap(raw).t : raw);
+    } else if (hit.type === 'backdropkey') {
+      const key = backdropKey(hit.id);
+      if (!key) return;
+      selectBackdropKey(key.id);
+      this.drag = { type: 'backdropkey', id: key.id, grab: this.t(px) - key.t };
+    } else if (hit.type === 'backdropLane') {
+      selectBackdropTrack();
+      this.drag = { type: 'backdropScrub' };
+      const raw = this.t(px);
+      emit('seek', e.shiftKey ? this.snap(raw).t : raw);
     } else if (hit.type === 'video') {
       const clip = videoClip(hit.kind, hit.id);
       if (!clip) return;
@@ -405,11 +505,51 @@ export class Timeline {
       const clip = audioClip(hit.kind, hit.id);
       if (!clip) return;
       this.drag = { type: 'audio', kind: hit.kind, id: hit.id, grab: this.t(px) - clip.start };
+    } else if (hit.type === 'particle') {
+      const e = particleEmitter(hit.id);
+      if (!e) return;
+      selectEmitter(hit.id);
+      this.drag = { type: 'particle', id: hit.id, edge: hit.edge, row: hit.row,
+                    grab: this.t(px) - e.start, len: e.end - e.start };
     } else if (hit.type === 'clip') {
       const c = clips().find(x => x.id === hit.id);
-      select('clip', c.id);
-      this.drag = { type: 'clip', id: c.id, edge: hit.edge,
-                    grab: this.t(px) - c.start, len: c.end - c.start };
+      if (e.metaKey || e.ctrlKey) {          // ⌘-click adds or removes a layer
+        selectClip(c.id, 'toggle');
+        this.draw();
+        return;
+      }
+      // ⇧ already means "ignore snapping" for the length of a drag, so a ⇧
+      // press only takes the run if the pointer never moves — the selection is
+      // therefore settled on the way up, not here.
+      // A stage handle is only offered on the layer already being edited, so
+      // grabbing one never changes what is selected.
+      if (hit.stage) {
+        this.drag = { type: 'clipStage', id: c.id, key: hit.stage };
+        this.draw();
+        return;
+      }
+      const range = e.shiftKey;
+      // Pressing a layer that is already in the selection keeps the group, so
+      // the whole run can be dragged; a click that does not move collapses it.
+      const held = selectedClipIds();
+      const inGroup = held.includes(c.id) && held.length > 1;
+      if (!range) selectClip(c.id, inGroup ? 'primary' : 'set');
+      // A locked layer can still be picked and edited in the inspector; only
+      // its timing is held. Nothing will drag, so its click settles now.
+      if (c.locked) {
+        if (range) selectClip(c.id, 'range');
+        this._tip(`${(c.text || '—').replace(/\n/g, ' ')} · locked`, px, this.trackTop(c.track));
+      } else {
+        // Trimming stays a single-layer edit; a move carries every unlocked
+        // layer in the selection with it. A ⇧-drag of an unselected layer
+        // keeps its old meaning and moves that one alone.
+        const group = hit.edge || !selectedClipIds().includes(c.id)
+          ? [c] : selectedClips().filter(x => !x.locked);
+        this.drag = { type: 'clip', id: c.id, edge: hit.edge,
+                      grab: this.t(px) - c.start, len: c.end - c.start,
+                      baseTrack: c.track, collapse: inGroup, range, moved: false, px0: px,
+                      group: group.map(x => ({ id: x.id, start: x.start, end: x.end, track: x.track })) };
+      }
     } else {
       if (hit.type === 'track') select(null, null);
       this.drag = { type: 'scrub' };
@@ -428,9 +568,12 @@ export class Timeline {
       this.hover = hit;
       this.canvas.style.cursor =
         hit.type === 'guide' || hit.type === 'end' || hit.type === 'levelEdge' ? 'ew-resize'
-        : hit.type === 'clip' ? (hit.edge ? 'ew-resize' : 'grab')
+        : hit.type === 'clip' ? (hit.locked ? 'not-allowed' : hit.stage ? 'col-resize' : hit.edge ? 'ew-resize' : 'grab')
         : hit.type === 'camkey' ? 'ew-resize'
         : hit.type === 'cameraLane' ? 'copy'
+        : hit.type === 'backdropkey' ? 'ew-resize'
+        : hit.type === 'backdropLane' ? 'copy'
+        : hit.type === 'particle' ? (hit.edge ? 'ew-resize' : 'grab')
         : hit.type === 'video' ? (this.drag ? 'grabbing' : 'grab')
         : hit.type === 'audio' ? (this.drag ? 'grabbing' : 'grab')
         : hit.type === 'audioLane' ? 'default'
@@ -447,6 +590,17 @@ export class Timeline {
     if (d.type === 'scrub') {
       const raw = this.t(px);
       emit('seek', e.shiftKey ? this.snap(raw).t : raw);
+
+    } else if (d.type === 'backdropScrub') {
+      const raw = this.t(px);
+      emit('seek', e.shiftKey ? this.snap(raw).t : raw);
+
+    } else if (d.type === 'backdropkey') {
+      const { t, kind } = this.snap(this.t(px) - d.grab, { ignore: free });
+      updateBackdropKey(d.id, { t: clamp(t, 0, dur) });
+      const key = backdropKey(d.id);
+      this._tip(`backdrop · ${fmtTime(key?.t ?? t)}${kind ? '  ⟡' + kind : ''}`,
+                px, LANE.backdrop[0]);
 
     } else if (d.type === 'guide') {
       const lv = level(d.key);
@@ -498,6 +652,28 @@ export class Timeline {
       this._tip(`${KIND[d.kind].short} · starts ${fmtTime(Math.max(0, t))}${t < 0 ? '  (trimmed in)' : ''}${kind ? '  ⟡' + kind : ''}`,
                 px, LANE[d.kind][0]);
 
+    } else if (d.type === 'particle') {
+      const e = particleEmitter(d.id);
+      if (!e) return;
+      const opts = { ignore: free, text: true };
+      if (d.edge === 'start') {
+        const { t, kind } = this.snap(this.t(px), opts);
+        setEmitterWindow(d.id, clamp(t, 0, e.end - MIN_CLIP), e.end);
+        this._tip(`in ${fmtTime(e.start)} · ${(e.end - e.start).toFixed(2)}s${kind ? '  ⟡' + kind : ''}`,
+                  px, this.particleRowTop(d.row ?? 0));
+      } else if (d.edge === 'end') {
+        const { t, kind } = this.snap(this.t(px), opts);
+        setEmitterWindow(d.id, e.start, clamp(t, e.start + MIN_CLIP, dur));
+        this._tip(`out ${fmtTime(e.end)} · ${(e.end - e.start).toFixed(2)}s${kind ? '  ⟡' + kind : ''}`,
+                  px, this.particleRowTop(d.row ?? 0));
+      } else {
+        const { t, kind } = this.snap(this.t(px) - d.grab, opts);
+        const s = clamp(t, 0, Math.max(0, dur - d.len));
+        setEmitterWindow(d.id, s, s + d.len);
+        this._tip(`${fmtTime(e.start)} → ${fmtTime(e.end)}${kind ? '  ⟡' + kind : ''}`,
+                  px, this.particleRowTop(d.row ?? 0));
+      }
+
     } else if (d.type === 'guideRange') {
       if (Math.abs(px - d.px0) > 3) d.moved = true;
       const lv = level(d.key);
@@ -534,10 +710,23 @@ export class Timeline {
                 px, ROW[d.key].lane[0]);
       emit('render');
 
+    } else if (d.type === 'clipStage') {
+      const c = clips().find(x => x.id === d.id);
+      if (!c) return;
+      // The pointer sets the boundary; the stage is what lies between it and
+      // the layer's own edge, and mid absorbs the difference.
+      const { t, kind } = this.snap(this.t(px), { ignore: free, text: true });
+      setStageDuration(c.id, d.key, d.key === 'in' ? t - c.start : c.end - t);
+      const ws = stageWindows(c);
+      const own = d.key === 'in' ? ws[0] : ws[2];
+      this._tip(`${d.key} ${own.dur.toFixed(2)}s · mid ${ws[1].dur.toFixed(2)}s${kind ? '  ⟡' + kind : ''}`,
+                px, this.trackTop(c.track));
+
     } else if (d.type === 'clip') {
       const c = clips().find(x => x.id === d.id);
       if (!c) return;
-      const opts = { ignore: free, exceptClip: c.id, text: true };
+      if (Math.abs(px - d.px0) > 3) d.moved = true;
+      const opts = { ignore: free, exceptClip: d.group.map(x => x.id), text: true };
       if (d.edge === 'start') {
         const { t, kind } = this.snap(this.t(px), opts);
         c.start = clamp(t, 0, c.end - MIN_CLIP);
@@ -546,13 +735,30 @@ export class Timeline {
         const { t, kind } = this.snap(this.t(px), opts);
         c.end = clamp(t, c.start + MIN_CLIP, dur);
         this._tip(`out ${fmtTime(c.end)} · ${(c.end - c.start).toFixed(2)}s${kind ? '  ⟡' + kind : ''}`, px, this.trackTop(c.track));
-      } else {
+      } else if (d.group.length) {
+        // The layer under the pointer leads: it snaps, and the rest of the
+        // group keeps its spacing by following the same offset.
+        const lead = d.group.find(x => x.id === d.id) ?? d.group[0];
         const { t, kind } = this.snap(this.t(px) - d.grab, opts);
-        c.start = clamp(t, 0, dur - d.len);
-        c.end = c.start + d.len;
-        const tr = this.trackAt(py);
-        if (tr >= 0) c.track = tr;
-        this._tip(`${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  track ${c.track + 1}${kind ? '  ⟡' + kind : ''}`, px, this.trackTop(c.track));
+        const first = Math.min(...d.group.map(x => x.start));
+        const last = Math.max(...d.group.map(x => x.end));
+        const dt = clamp(t - lead.start, -first, dur - last);
+        const rows = this.trackAt(py);
+        const loTrack = Math.min(...d.group.map(x => x.track));
+        const hiTrack = Math.max(...d.group.map(x => x.track));
+        const dtr = rows >= 0
+          ? clamp(rows - d.baseTrack, -loTrack, TRACKS - 1 - hiTrack) : 0;
+        for (const snap of d.group) {
+          const clip = clips().find(x => x.id === snap.id);
+          if (!clip) continue;
+          clip.start = snap.start + dt;
+          clip.end = snap.end + dt;
+          clip.track = snap.track + dtr;
+        }
+        this._tip(d.group.length > 1
+          ? `${d.group.length} layers  ·  ${dt >= 0 ? '+' : ''}${dt.toFixed(2)}s${dtr ? `  ·  ${dtr > 0 ? '+' : ''}${dtr} track` : ''}${kind ? '  ⟡' + kind : ''}`
+          : `${fmtTime(c.start)} → ${fmtTime(c.end)}  ·  track ${c.track + 1}${kind ? '  ⟡' + kind : ''}`,
+          px, this.trackTop(c.track));
       }
       emit('render');
 
@@ -569,8 +775,9 @@ export class Timeline {
         lv.guides.forEach((g, i) => { g.t = keep ? snap.guides[i] : snap.guides[i] * k; });
       }
       clips().forEach((c, i) => {
-        c.start = keep ? d.clips[i].start : d.clips[i].start * k;
-        c.end = keep ? d.clips[i].end : d.clips[i].end * k;
+        const held = keep || d.clips[i].locked;
+        c.start = held ? d.clips[i].start : d.clips[i].start * k;
+        c.end = held ? d.clips[i].end : d.clips[i].end * k;
       });
       state.project.duration = nd;
       const ov = level('overall');
@@ -596,6 +803,7 @@ export class Timeline {
     this._tip(null);
     if (d.type === 'video') emit('video', state.video);
     else if (d.type === 'audio') emit('audio', state.audio);   // resyncs playback and the panel
+    else if (d.type === 'backdropkey') commitBackdropKeys();
     else if (d.type === 'end') setDuration(state.project.duration, { scale: false });
     else if (d.type === 'guideRange') {
       // a click, not a drag: that point becomes the centre the run scales about
@@ -611,7 +819,19 @@ export class Timeline {
       else commitGuides(d.key);
     }
     else if (d.type === 'guide' || d.type === 'levelEdge') commitGuides(d.key);
-    else if (d.type === 'clip') commitClips();
+    else if (d.type === 'clip') {
+      if (!d.moved) {
+        if (d.range) selectClip(d.id, 'range');          // ⇧-click took the run
+        else if (d.collapse) selectClip(d.id, 'set');
+      } else if (d.range && !d.edge && d.group.length <= 1) {
+        // A ⇧-drag moved one unselected layer: it becomes the selection, as it
+        // would have without the modifier. A group move leaves the group alone.
+        selectClip(d.id, 'set');
+      }
+      commitClips();
+    }
+    else if (d.type === 'clipStage') commitClips();
+    else if (d.type === 'particle') commitEmitters();
     else if (d.type === 'camkey') commitCameraKeys();
     else if (d.type === 'marquee' && Math.abs(d.x1 - d.x0) < 4) {
       select(null, null);                     // a plain click in the lane clears and scrubs
@@ -641,6 +861,18 @@ export class Timeline {
       const t = this.snap(hit.t).t;
       if (hit.axis) addCameraChannelKey(hit.axis, t);
       else addCameraKey(t);
+      this.draw();
+      return;
+    }
+    if (hit.type === 'backdropLane') {
+      addBackdropKey(this.snap(hit.t).t);
+      this.draw();
+      return;
+    }
+    if (hit.type === 'particleLane') {
+      const start = this.snap(hit.t).t;
+      const end = Math.min(state.project.duration, Math.max(start + MIN_CLIP, start + 4));
+      addParticleEmitter({ start, end });
       this.draw();
       return;
     }
@@ -682,7 +914,9 @@ export class Timeline {
     this._drawBeats(g);
     for (const kind of AUDIO_LANES) if (LANE[kind]) this._drawAudioLane(g, kind);
     this._drawCameraLane(g);
+    this._drawBackdropLane(g);
     this._drawTracks(g);
+    this._drawParticleLane(g);
     for (const kind of VIDEO_LANES) if (LANE[kind]) this._drawVideoLane(g, kind);
     this._drawGuideLines(g, 'overall');
     this._drawGuideLines(g, 'animation');
@@ -748,7 +982,133 @@ export class Timeline {
     }
   }
 
-  /** One backdrop lane: multiple independently slippable visual regions. */
+  /** The backdrop colour track: a colour preview rail with draggable keys. */
+  _drawBackdropLane(g) {
+    const [y0, y1] = LANE.backdrop;
+    const h = y1 - y0;
+    const mid = (y0 + y1) / 2;
+    const b = backdrop();
+    const selected = state.ui.sel?.type === 'backdrop' || state.ui.sel?.type === 'backdropkey';
+    const keys = backdropKeys();
+    const modeLabel = b.mode === 'radial' ? 'circular' : b.mode === 'four-point' ? '4-point' : b.mode;
+
+    g.fillStyle = selected ? '#12151d' : '#0a0c11';
+    g.fillRect(0, y0, this.w, h);
+
+    // A sampled strip keeps the track useful as a glanceable colour overview,
+    // even when the actual output is a multi-stop gradient.
+    for (let x = 26; x < this.w; x += 4) {
+      const value = backdropAt(b, this.t(x + 2));
+      g.fillStyle = sampleBackdrop(value, 0.5, 0.5);
+      g.globalAlpha = 0.58;
+      g.fillRect(x, y0 + 2, 4, h - 4);
+    }
+    g.globalAlpha = 1;
+    g.fillStyle = '#0a0c11';
+    g.fillRect(0, y0, 26, h);
+    g.fillStyle = selected ? '#e4e8ef' : keys.length ? '#aab4c3' : '#2b3340';
+    g.font = '9px ui-monospace, monospace';
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText('BG', 4, mid);
+    g.fillStyle = selected ? '#c3cad6' : '#667184';
+    g.fillText(`${modeLabel}${keys.length ? ` · ${keys.length} key${keys.length === 1 ? '' : 's'}` : ''}`, 30, y0 + 8);
+
+    g.strokeStyle = selected ? '#c4b5fd99' : '#a78bfa66';
+    g.lineWidth = selected ? 1.5 : 1;
+    g.beginPath(); g.moveTo(28, mid + 0.5); g.lineTo(this.w, mid + 0.5); g.stroke();
+
+    if (!keys.length) {
+      g.fillStyle = '#c3cad688';
+      g.fillText('double-click to add a backdrop key', 30, y1 - 7);
+      return;
+    }
+
+    for (const key of keys) {
+      const x = this.x(key.t);
+      if (x < -12 || x > this.w + 12) continue;
+      const on = state.ui.sel?.type === 'backdropkey' && state.ui.sel.id === key.id;
+      const hov = this.hover?.type === 'backdropkey' && this.hover.id === key.id;
+      const r = on || hov ? 6 : 5;
+      const fill = sampleBackdrop({ ...key, mode: b.mode }, 0.5, 0.5);
+      g.beginPath();
+      g.moveTo(x, mid - r); g.lineTo(x + r, mid); g.lineTo(x, mid + r); g.lineTo(x - r, mid);
+      g.closePath();
+      g.fillStyle = on ? '#f4f7fb' : fill;
+      g.fill();
+      g.strokeStyle = hov || on ? '#f4f7fb' : '#0d0f14';
+      g.lineWidth = on || hov ? 1.5 : 1;
+      g.stroke();
+    }
+  }
+
+  /** One row per emitter: its live window, plus the tail its particles fade over. */
+  _drawParticleLane(g) {
+    const lane = LANE.particles;
+    if (!lane) return;
+    const [y0, y1] = lane;
+    g.fillStyle = '#0a0c11';
+    g.fillRect(0, y0, this.w, y1 - y0);
+    g.fillStyle = '#2b3340';
+    g.font = '9px ui-monospace, monospace';
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText('PTCL', 4, y0 + PARTICLE_H / 2);
+    particleEmitters().forEach((e, i) => this._drawEmitter(g, e, i));
+  }
+
+  _drawEmitter(g, e, i) {
+    const top = this.particleRowTop(i);
+    const x0 = this.x(e.start);
+    const x1 = Math.max(x0 + 2, this.x(e.end));
+    const sel = activeEmitterId() === e.id;
+    const hot = (this.hover?.type === 'particle' && this.hover.id === e.id) ||
+                (this.drag?.type === 'particle' && this.drag.id === e.id);
+    const col = e.on ? e.colorA : '#3f4653';
+
+    // Particles born before the out-point live on: show that as a fading tail
+    // rather than letting the block imply a hard cut.
+    const xt = this.x(e.end + e.life * (1 + e.lifeJitter * 0.5));
+    if (e.on && xt > x1) {
+      const grad = g.createLinearGradient(x1, 0, xt, 0);
+      grad.addColorStop(0, col + '3a');
+      grad.addColorStop(1, col + '00');
+      g.fillStyle = grad;
+      g.fillRect(x1, top + 4, xt - x1, PARTICLE_H - 8);
+    }
+
+    g.save();
+    this._roundRect(g, x0, top + 1, x1 - x0, PARTICLE_H - 2, 4);
+    g.fillStyle = '#0c1219';
+    g.fill();
+    g.clip();
+
+    g.globalAlpha = e.on ? 0.22 : 0.10;
+    g.fillStyle = col;
+    g.fillRect(x0, top + 1, x1 - x0, PARTICLE_H - 2);
+
+    // A scatter standing in for the particles themselves, denser at a higher rate.
+    const step = clamp(900 / Math.max(1, e.rate), 10, 34);
+    g.globalAlpha = e.on ? 0.5 : 0.2;
+    for (let k = 0, x = x0 + 6; x < x1 - 2; k++, x += step) {
+      const cy = top + 5 + ((k * 5) % Math.max(1, PARTICLE_H - 11));
+      g.beginPath();
+      g.arc(x, cy, 1.1, 0, Math.PI * 2);
+      g.fill();
+    }
+
+    g.globalAlpha = 1;
+    g.fillStyle = hot || sel ? '#e8edf5' : '#aab4c3';
+    g.font = '9px ui-monospace, monospace';
+    g.textAlign = 'left'; g.textBaseline = 'middle';
+    const name = e.name || `Emitter ${i + 1}`;
+    g.fillText(`${e.on ? '' : '○ '}${name}   ${Math.round(e.rate)}/s`, x0 + 6, top + PARTICLE_H / 2);
+    g.restore();
+
+    g.strokeStyle = hot || sel ? col : col + '88';
+    g.lineWidth = sel ? 1.5 : 1;
+    this._roundRect(g, x0, top + 1, x1 - x0, PARTICLE_H - 2, 4);
+    g.stroke();
+  }
+
   _drawVideoLane(g, kind) {
     const meta = VIDEO_KIND[kind];
     const [y0, y1] = LANE[kind];
@@ -842,8 +1202,12 @@ export class Timeline {
     g.textAlign = 'left'; g.textBaseline = 'middle';
     g.fillText(meta.short, 4, mid);
 
-    const lane = audioClips(kind).filter(clip => clip.ready && clip.peaks && clip.duration > 0);
-    if (!lane.length) {
+    const saved = savedAudioClips(kind);
+    const lane = saved.filter(clip => clip.ready && clip.peaks && clip.duration > 0);
+    // A freshly opened project holds saved references until their files are
+    // re-imported — show where they sit rather than claiming the lane is empty.
+    const pending = saved.filter(clip => !clip.ready && (clip.name || clip.duration > 0));
+    if (!lane.length && !pending.length) {
       g.strokeStyle = '#161c25';
       g.beginPath(); g.moveTo(26, mid + 0.5); g.lineTo(this.w, mid + 0.5); g.stroke();
       g.fillStyle = '#2b3340';
@@ -851,7 +1215,29 @@ export class Timeline {
       return;
     }
 
+    for (const clip of pending) this._drawPendingAudioClip(g, clip, y0, y1);
     for (const clip of lane) this._drawAudioClip(g, kind, clip, y0, y1);
+  }
+
+  /** A saved-but-unattached clip: outline only, so its timing stays visible. */
+  _drawPendingAudioClip(g, clip, y0, y1) {
+    const h = y1 - y0;
+    const rx0 = this.x(clip.start);
+    const rx1 = Math.max(rx0 + 40, this.x(clip.start + Math.max(0, clip.duration)));
+
+    g.save();
+    g.setLineDash([3, 3]);
+    this._roundRect(g, rx0, y0 + 2, rx1 - rx0, h - 4, 4);
+    g.strokeStyle = '#3b4657';
+    g.lineWidth = 1;
+    g.stroke();
+    g.setLineDash([]);
+    g.clip();
+    g.fillStyle = '#5a6577';
+    g.font = '9px ui-monospace, monospace';
+    g.textAlign = 'left'; g.textBaseline = 'top';
+    g.fillText(`○ ${clip.name || 'unattached'} · re-import`, rx0 + 6, y0 + 4);
+    g.restore();
   }
 
   _drawAudioClip(g, kind, clip, y0, y1) {
@@ -944,15 +1330,23 @@ export class Timeline {
     const [y0, y1] = LANE.camera;
     const h = y1 - y0;
     const mid = (y0 + y1) / 2;
+    const selected = state.ui.sel?.type === 'camera' || state.ui.sel?.type === 'camkey';
 
-    g.fillStyle = '#0a0c11';
+    g.fillStyle = selected ? '#12101a' : '#0a0c11';
     g.fillRect(0, y0, this.w, h);
+    if (selected) {
+      g.fillStyle = '#7d6cb044';
+      g.fillRect(0, y0, 3, h);
+      g.strokeStyle = '#7d6cb055';
+      g.lineWidth = 1;
+      g.strokeRect(0.5, y0 + 0.5, this.w - 1, h - 1);
+    }
     if (cameraMode() === 'split') {
       for (const axis of ['x', 'y', 'z']) this._drawSplitCameraChannel(g, cam, axis);
       return;
     }
 
-    g.fillStyle = cam.enabled && cam.keys.length ? '#7d6cb0' : '#242b37';
+    g.fillStyle = selected ? '#e4e8ef' : cam.enabled && cam.keys.length ? '#7d6cb0' : '#242b37';
     g.font = '9px ui-monospace, monospace';
     g.textAlign = 'left'; g.textBaseline = 'middle';
     g.fillText('CAM', 4, mid);
@@ -1012,10 +1406,18 @@ export class Timeline {
     const mid = (y0 + y1) / 2;
     const color = CAMERA_AXIS_META[axis].color;
     const keys = cameraChannelKeys(axis);
+    const selected = state.ui.sel?.type === 'camera' || state.ui.sel?.type === 'camkey';
 
-    g.fillStyle = '#0a0c11';
+    g.fillStyle = selected ? '#12101a' : '#0a0c11';
     g.fillRect(0, y0, this.w, h);
-    g.fillStyle = cam.enabled && keys.length ? color : '#242b37';
+    if (selected) {
+      g.fillStyle = '#7d6cb044';
+      g.fillRect(0, y0, 3, h);
+      g.strokeStyle = '#7d6cb055';
+      g.lineWidth = 1;
+      g.strokeRect(0.5, y0 + 0.5, this.w - 1, h - 1);
+    }
+    g.fillStyle = selected ? '#e4e8ef' : cam.enabled && keys.length ? color : '#242b37';
     g.font = '9px ui-monospace, monospace';
     g.textAlign = 'left'; g.textBaseline = 'middle';
     g.fillText(axis.toUpperCase(), 5, mid);
@@ -1302,27 +1704,59 @@ export class Timeline {
 
   _drawClips(g) {
     const sel = state.ui.sel;
+    const picked = new Set(selectedClipIds());
     for (const c of clips()) {
       const x0 = this.x(c.start), x1 = this.x(c.end);
       if (x1 < -20 || x0 > this.w + 20) continue;
       const y = this.trackTop(c.track);
       const w = Math.max(2, x1 - x0);
       const role = ROLES[drivingRegion(state.project.levels, c.start).role];
-      const on = sel?.type === 'clip' && sel.id === c.id;
+      const on = picked.has(c.id);
+      const primary = sel?.type === 'clip' && sel.id === c.id;
       const hov = this.hover?.type === 'clip' && this.hover.id === c.id;
 
       g.fillStyle = on ? role.color + '40' : hov ? role.color + '2a' : role.color + '1e';
       this._roundRect(g, x0, y + 1, w, TRACK_H - 2, 4); g.fill();
-      g.strokeStyle = on ? role.color : role.color + '66';
+      // The primary layer — the one the inspector edits — is outlined brightest.
+      g.strokeStyle = primary ? '#e4e8ef' : on ? role.color : role.color + '66';
       g.lineWidth = on ? 1.5 : 1;
+      // A dashed outline reads as "this one is pinned to its own timing".
+      if (c.locked) g.setLineDash([3, 2]);
       this._roundRect(g, x0 + 0.5, y + 1.5, w - 1, TRACK_H - 3, 4); g.stroke();
+      g.setLineDash([]);
 
       g.fillStyle = role.color;
       g.fillRect(x0 + 1, y + 2, 2.5, TRACK_H - 4);
 
+      // The three stages, drawn the way a fade is: the in ramp rises to where
+      // mid takes over, the out ramp falls from where mid ends. The hairlines
+      // between them are what a drag grabs.
+      const ws = stageWindows(c);
+      const xa = this.x(ws[0].end), xb = this.x(ws[1].end);
+      if (w > 14) {
+        const top = y + 2.5, bot = y + TRACK_H - 2.5;
+        g.save();
+        this._roundRect(g, x0, y + 1, w, TRACK_H - 2, 4); g.clip();
+        g.strokeStyle = role.color + (on ? 'aa' : '66');
+        g.lineWidth = 1;
+        g.beginPath();
+        if (ws[0].dur > 0) { g.moveTo(x0, bot); g.lineTo(xa, top); }
+        if (ws[2].dur > 0) { g.moveTo(xb, top); g.lineTo(x1, bot); }
+        g.stroke();
+        for (const [x, stage] of [[xa, ws[0]], [xb, ws[2]]]) {
+          if (stage.dur <= 0) continue;
+          g.strokeStyle = role.color + (on ? '88' : '44');
+          g.setLineDash([2, 2]);
+          g.beginPath(); g.moveTo(x, y + 1.5); g.lineTo(x, y + TRACK_H - 1.5); g.stroke();
+          g.setLineDash([]);
+        }
+        g.restore();
+      }
+
+      const badge = c.locked && w > 26;
       if (w > 20) {
         g.save();
-        g.beginPath(); g.rect(x0 + 5, y, w - 8, TRACK_H); g.clip();
+        g.beginPath(); g.rect(x0 + 5, y, w - 8 - (badge ? 11 : 0), TRACK_H); g.clip();
         g.fillStyle = '#e6eaf1';
         g.font = '600 10px system-ui, "PingFang TC", "Noto Sans TC", sans-serif';
         g.textAlign = 'left'; g.textBaseline = 'middle';
@@ -1330,16 +1764,45 @@ export class Timeline {
         if (w > 70) {
           g.fillStyle = '#7d8798';
           g.font = '9px ui-monospace, monospace';
-          g.fillText(`${c.effect} · ${(c.end - c.start).toFixed(2)}s`, x0 + 8, y + TRACK_H / 2 + 7);
+          g.fillText(`${stageNames(c)} · ${(c.end - c.start).toFixed(2)}s`, x0 + 8, y + TRACK_H / 2 + 7);
         }
         g.restore();
       }
-      if (on && w > 14) {
+      if (badge) this._lockBadge(g, x1 - 9, y + TRACK_H / 2, role.color);
+      // Trim handles are only drawn where a trim is actually possible.
+      if (primary && !c.locked && w > 14) {
         g.fillStyle = '#e4e8ef';
         g.fillRect(x0 + 1, y + TRACK_H / 2 - 5, 2, 10);
         g.fillRect(x1 - 3, y + TRACK_H / 2 - 5, 2, 10);
       }
+      // Stage handles ride the same rule as the hit test: the layer being
+      // edited, and only where there is room to aim at them.
+      if (primary && !c.locked && w >= 26) {
+        const hotStage = this.drag?.type === 'clipStage' && this.drag.id === c.id
+          ? this.drag.key
+          : this.hover?.type === 'clip' && this.hover.id === c.id ? this.hover.stage : null;
+        for (const [x, key] of [[xa, 'in'], [xb, 'out']]) {
+          g.fillStyle = hotStage === key ? '#e4e8ef' : role.color;
+          g.beginPath();
+          g.moveTo(x - 3, y + 1.5); g.lineTo(x + 3, y + 1.5); g.lineTo(x, y + 5.5);
+          g.closePath(); g.fill();
+        }
+      }
     }
+  }
+
+  /** Small padlock drawn on a locked layer, centred on (cx, cy). */
+  _lockBadge(g, cx, cy, color) {
+    g.save();
+    g.strokeStyle = color;
+    g.fillStyle = color;
+    g.lineWidth = 1;
+    g.beginPath();
+    g.arc(cx, cy - 1.5, 2, Math.PI, 0);          // shackle
+    g.stroke();
+    this._roundRect(g, cx - 3, cy - 1.5, 6, 5, 1);
+    g.fill();
+    g.restore();
   }
 
   _drawPlayhead(g) {

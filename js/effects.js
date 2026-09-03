@@ -2,10 +2,18 @@
 //
 // An effect is a pure function that writes a per-glyph transform for the current
 // moment. It receives the glyph's slot in the line and `u` — progress through its
-// own stage, 0 → 1 — so it owns the full arc: entrance, life, exit.
+// own arc, 0 → 1 — so it owns the whole of it: entrance, life, exit.
 //
 //   g : { x, y, z, rx, ry, rz, sx, sy, sz, opacity }   pre-filled with the rest layout
-//   c : { i, n, u, t, time, pulse, react, rnd, p, W, H, size }
+//   c : { i, n, u, t, time, pulse, react, rnd, p, W, H, size, stage }
+//
+// A text layer plays three of them in sequence — in, mid, out — each over its
+// own slice of the layer. `arc: [a, b]` says where in its own 0→1 an effect has
+// finished arriving and where it starts leaving, so a stage can be handed the
+// part of that effect it actually wants: the entrance for `in`, the body for
+// `mid`, the exit for `out`, each stretched across the stage's duration. One
+// effect used for all three stages, split on its own arc, animates exactly as
+// it did when it owned the layer alone.
 
 import { clamp, lerp, hash, smoothstep,
          easeOutCubic, easeOutQuint, easeInCubic, easeInOutCubic, easeOutBack, easeOutElastic } from './util.js';
@@ -38,7 +46,7 @@ export const EFFECTS = {
   // ── 起 · open ──────────────────────────────────────────────
   // 起 is a strike, not a passage — it lands fast and hands over.
   strike: {
-    label: 'Strike', roles: ['qi'],
+    label: 'Strike', roles: ['qi'], arc: [0.34, 0.86],
     params: [P('impact', 'Impact', 0, 3, 0.01, 1.5), P('stag', 'Stagger', 0, 0.9, 0.01, 0.22),
              P('shake', 'Shake', 0, 1, 0.01, 0.35)],
     apply(g, c) {
@@ -54,7 +62,7 @@ export const EFFECTS = {
   },
 
   rise: {
-    label: 'Rise', roles: ['qi'],
+    label: 'Rise', roles: ['qi'], arc: [0.4, 0.72],
     params: [P('dist', 'Distance', 0, 1.2, 0.01, 0.45), P('stag', 'Stagger', 0, 0.95, 0.01, 0.6),
              P('span', 'Entrance', 0.05, 0.9, 0.01, 0.4)],
     apply(g, c) {
@@ -67,7 +75,7 @@ export const EFFECTS = {
   },
 
   fadeScale: {
-    label: 'Bloom', roles: ['qi'],
+    label: 'Bloom', roles: ['qi'], arc: [0.38, 0.76],
     params: [P('from', 'Start scale', 0.1, 1.8, 0.01, 0.55), P('stag', 'Stagger', 0, 0.95, 0.01, 0.35),
              P('rot', 'Twist', 0, 1, 0.01, 0.2)],
     apply(g, c) {
@@ -81,7 +89,7 @@ export const EFFECTS = {
   },
 
   typewriter: {
-    label: 'Typewriter', roles: ['qi'],
+    label: 'Typewriter', roles: ['qi'], arc: [0.5, 0.82],
     params: [P('span', 'Type over', 0.1, 0.95, 0.01, 0.5), P('kick', 'Kick', 0, 1, 0.01, 0.45),
              P('cursor', 'Cursor sway', 0, 1, 0.01, 0.3)],
     apply(g, c) {
@@ -97,7 +105,7 @@ export const EFFECTS = {
   },
 
   unfold: {
-    label: 'Unfold', roles: ['qi', 'zhuan'],
+    label: 'Unfold', roles: ['qi', 'zhuan'], arc: [0.45, 0.78],
     params: [P('axis', 'Axis (0=X 1=Y)', 0, 1, 1, 0), P('stag', 'Stagger', 0, 0.95, 0.01, 0.7),
              P('depth', 'Depth push', 0, 1, 0.01, 0.4)],
     apply(g, c) {
@@ -114,7 +122,7 @@ export const EFFECTS = {
   // 承 picks the piece up where 起 left it: gathered at that one point,
   // then spreading outward slowly across the whole stage.
   spread: {
-    label: 'Spread', roles: ['cheng'],
+    label: 'Spread', roles: ['cheng'], arc: [0.05, 0.9],
     params: [P('gather', 'Gather at start', 0, 1, 0.01, 0.88), P('span', 'Spread over', 0.15, 1, 0.01, 0.78),
              P('sway', 'Sway', 0, 1, 0.01, 0.3)],
     apply(g, c) {
@@ -131,7 +139,7 @@ export const EFFECTS = {
   },
 
   breathe: {
-    label: 'Breathe', roles: ['cheng'],
+    label: 'Breathe', roles: ['cheng'], arc: [0.12, 0.9],
     params: [P('amt', 'Amount', 0, 0.4, 0.005, 0.06), P('rate', 'Rate', 0.05, 3, 0.01, 0.4),
              P('phase', 'Per-glyph phase', 0, 1, 0.01, 0.35)],
     apply(g, c) {
@@ -145,7 +153,7 @@ export const EFFECTS = {
   },
 
   wave: {
-    label: 'Wave', roles: ['cheng'],
+    label: 'Wave', roles: ['cheng'], arc: [0.16, 0.86],
     params: [P('amp', 'Amplitude', 0, 0.5, 0.005, 0.09), P('len', 'Wavelength', 0.2, 6, 0.05, 1.4),
              P('speed', 'Speed', 0, 3, 0.01, 0.7)],
     apply(g, c) {
@@ -159,7 +167,7 @@ export const EFFECTS = {
   },
 
   drift: {
-    label: 'Drift', roles: ['cheng'],
+    label: 'Drift', roles: ['cheng'], arc: [0.18, 0.84],
     params: [P('amt', 'Spread', 0, 1, 0.01, 0.22), P('rate', 'Rate', 0.02, 1.5, 0.01, 0.22),
              P('depth', 'Parallax', 0, 1, 0.01, 0.45)],
     apply(g, c) {
@@ -175,7 +183,7 @@ export const EFFECTS = {
   },
 
   tracking: {
-    label: 'Tracking', roles: ['cheng'],
+    label: 'Tracking', roles: ['cheng'], arc: [0.14, 0.88],
     params: [P('open', 'Open to', -0.4, 1.5, 0.01, 0.5), P('from', 'Start at', -0.6, 1, 0.01, -0.12),
              P('lift', 'Lift', 0, 1, 0.01, 0.15)],
     apply(g, c) {
@@ -192,7 +200,7 @@ export const EFFECTS = {
 
   // ── 轉 · turn ─────────────────────────────────────────────
   shatter: {
-    label: 'Shatter', roles: ['zhuan'],
+    label: 'Shatter', roles: ['zhuan'], arc: [0.08, 0.9],
     params: [P('force', 'Force', 0, 1.5, 0.01, 0.45), P('spin', 'Spin', 0, 1.5, 0.01, 0.5),
              P('decay', 'Settle', 0.5, 12, 0.1, 4)],
     apply(g, c) {
@@ -210,7 +218,7 @@ export const EFFECTS = {
   },
 
   flip: {
-    label: 'Flip', roles: ['zhuan'],
+    label: 'Flip', roles: ['zhuan'], arc: [0.1, 0.92],
     params: [P('turns', 'Turns', 0.5, 4, 0.5, 1), P('stag', 'Stagger', 0, 0.95, 0.01, 0.65),
              P('axis', 'Axis (0=X 1=Y)', 0, 1, 1, 1)],
     apply(g, c) {
@@ -225,7 +233,7 @@ export const EFFECTS = {
   },
 
   glitch: {
-    label: 'Glitch', roles: ['zhuan'],
+    label: 'Glitch', roles: ['zhuan'], arc: [0.06, 0.94],
     params: [P('amt', 'Displace', 0, 1, 0.01, 0.35), P('rate', 'Rate', 1, 30, 1, 12),
              P('slice', 'Dropout', 0, 0.9, 0.01, 0.25)],
     apply(g, c) {
@@ -243,7 +251,7 @@ export const EFFECTS = {
   },
 
   explode: {
-    label: 'Explode', roles: ['zhuan'],
+    label: 'Explode', roles: ['zhuan'], arc: [0.22, 0.45],
     params: [P('force', 'Force', 0, 2, 0.01, 0.7), P('hold', 'Hold', 0, 0.9, 0.01, 0.45),
              P('spin', 'Spin', 0, 2, 0.01, 0.6)],
     apply(g, c) {
@@ -261,7 +269,7 @@ export const EFFECTS = {
   },
 
   scramble: {
-    label: 'Scramble', roles: ['zhuan'],
+    label: 'Scramble', roles: ['zhuan'], arc: [0.1, 0.88],
     params: [P('amt', 'Swap range', 0, 1.5, 0.01, 0.6), P('rate', 'Rate', 0.5, 12, 0.5, 4),
              P('tilt', 'Tilt', 0, 1, 0.01, 0.4)],
     apply(g, c) {
@@ -280,7 +288,7 @@ export const EFFECTS = {
 
   // ── 合 · close ────────────────────────────────────────────
   converge: {
-    label: 'Converge', roles: ['he'],
+    label: 'Converge', roles: ['he'], arc: [0.55, 0.9],
     params: [P('spread', 'From', 0, 2, 0.01, 0.8), P('span', 'Settle over', 0.1, 0.95, 0.01, 0.55),
              P('spin', 'Spin in', 0, 2, 0.01, 0.5)],
     apply(g, c) {
@@ -297,7 +305,7 @@ export const EFFECTS = {
   },
 
   collapse: {
-    label: 'Collapse', roles: ['he'],
+    label: 'Collapse', roles: ['he'], arc: [0.2, 0.5],
     params: [P('hold', 'Hold', 0, 0.9, 0.01, 0.5), P('to', 'End scale', 0, 1, 0.01, 0.02),
              P('spin', 'Spin', 0, 2, 0.01, 0.35)],
     apply(g, c) {
@@ -312,7 +320,7 @@ export const EFFECTS = {
   },
 
   dissolve: {
-    label: 'Dissolve', roles: ['he'],
+    label: 'Dissolve', roles: ['he'], arc: [0.14, 0.4],
     params: [P('lift', 'Lift', -1, 1, 0.01, 0.35), P('span', 'Fade over', 0.1, 0.95, 0.01, 0.6),
              P('blurScale', 'Bloat', 0, 1, 0.01, 0.35)],
     apply(g, c) {
@@ -329,7 +337,7 @@ export const EFFECTS = {
 
   // ── universal ─────────────────────────────────────────────
   zoom: {
-    label: 'Zoom', roles: ['qi', 'cheng', 'zhuan', 'he'],
+    label: 'Zoom', roles: ['qi', 'cheng', 'zhuan', 'he'], arc: [0.14, 0.86],
     params: [P('from', 'From depth', -2, 2, 0.01, 1), P('to', 'To depth', -2, 2, 0.01, -0.35),
              P('roll', 'Roll', -1, 1, 0.01, 0.1)],
     apply(g, c) {
@@ -343,7 +351,7 @@ export const EFFECTS = {
   },
 
   hold: {
-    label: 'Hold (no motion)', roles: ['qi', 'cheng', 'zhuan', 'he'],
+    label: 'Hold (no motion)', roles: ['qi', 'cheng', 'zhuan', 'he'], arc: [0.1, 0.9],
     params: [P('fade', 'Fade edges', 0, 0.5, 0.01, 0.1)],
     apply(g, c) {
       const f = Math.max(0.001, c.p.fade);
@@ -366,4 +374,135 @@ export function resolveParams(effectId, params = {}) {
 
 export function applyEffect(effectId, g, c) {
   (EFFECTS[effectId] ?? EFFECTS.hold).apply(g, c);
+}
+
+// ── stages ───────────────────────────────────────────────────
+// A layer is `in` → `mid` → `out`, each with its own effect, params and length
+// in seconds. Only `in` and `out` are authored: `mid` is whatever is left, so a
+// trim never leaves a gap and the three always add up to the layer.
+
+export const STAGE_KEYS = ['in', 'mid', 'out'];
+const DEFAULT_ARC = [0.3, 0.85];
+
+/** [arrived, leaving] — the effect's own progress either side of its body. */
+export function effectArc(effectId) {
+  const a = (EFFECTS[effectId] ?? EFFECTS.hold).arc ?? DEFAULT_ARC;
+  return [clamp(a[0], 0, 1), clamp(Math.max(a[1], a[0]), 0, 1)];
+}
+
+/** One stage's settings, filled in from the effect it names. */
+export function clipStage(clip, key) {
+  const s = clip?.stages?.[key];
+  const effect = EFFECTS[s?.effect] ? s.effect : 'hold';
+  return { key, effect, params: s?.params ?? {} };
+}
+
+/**
+ * Where in an effect's own arc a stage sits: `local` (0 → 1 through the stage)
+ * mapped onto the entrance, the body or the exit of that effect.
+ */
+export function stageU(effectId, key, local) {
+  const [a, b] = effectArc(effectId);
+  const k = clamp(local, 0, 1);
+  if (key === 'in') return k * a;
+  if (key === 'out') return b + k * (1 - b);
+  return a + k * (b - a);
+}
+
+/** The three stages of a layer as absolute times, in order. */
+export function stageWindows(clip) {
+  const len = Math.max(1e-4, clip.end - clip.start);
+  const inDur = clamp(Number(clip?.stages?.in?.dur) || 0, 0, len);
+  const outDur = clamp(Number(clip?.stages?.out?.dur) || 0, 0, len - inDur);
+  const midDur = Math.max(0, len - inDur - outDur);
+  const a = clip.start + inDur, b = a + midDur;
+  return [
+    { key: 'in',  start: clip.start, end: a,         dur: inDur },
+    { key: 'mid', start: a,          end: b,         dur: midDur },
+    { key: 'out', start: b,          end: clip.end,  dur: outDur }
+  ];
+}
+
+/**
+ * The stage playing at `time`, and how far through it that is. Empty stages are
+ * skipped: a layer with no in stage opens straight into its mid.
+ */
+export function stageAt(clip, time) {
+  const windows = stageWindows(clip);
+  const live = windows.filter(w => w.dur > 1e-6);
+  if (!live.length) return { ...windows[1], local: 0.5 };
+  const w = live.find(x => time < x.end) ?? live[live.length - 1];
+  return { ...w, local: clamp((time - w.start) / w.dur, 0, 1) };
+}
+
+// ── text style ───────────────────────────────────────────────
+//
+// The stage carries one text style. A layer inherits every part of it and
+// overrides only what it sets for itself, so retyping the stage colour or
+// typeface moves every layer that never disagreed with it. A layer field that
+// is null or absent means "from the stage" — which is why a new layer is
+// written with none of them.
+
+export const TEXT_STYLE = {
+  font: 0,                 // which typeface slot leads the stack
+  color: '#ffffff',
+  size: 0.2,               // of the frame's short edge
+  lineHeight: 1.25,
+  tracking: 0,
+  align: 'center'
+};
+
+export const TEXT_STYLE_KEYS = Object.keys(TEXT_STYLE);
+
+/** Does this layer set its own value for `key`, rather than taking the stage's? */
+export const overridesStyle = (clip, key) => clip?.[key] !== null && clip?.[key] !== undefined;
+
+/** The stage's text style, filled in from the built-in one. */
+export function stageStyle(project) {
+  const saved = project?.textStyle;
+  const out = { ...TEXT_STYLE };
+  if (saved && typeof saved === 'object') {
+    for (const key of TEXT_STYLE_KEYS) if (overridesStyle(saved, key)) out[key] = saved[key];
+  }
+  return out;
+}
+
+/** What a layer actually draws with: its own settings laid over the stage's. */
+export function clipStyle(clip, project) {
+  const out = stageStyle(project);
+  for (const key of TEXT_STYLE_KEYS) if (overridesStyle(clip, key)) out[key] = clip[key];
+  return out;
+}
+
+/**
+ * Is a layer on screen at `time`?
+ *
+ * A layer runs over [start, end), so where one layer's out point is the next
+ * one's in point exactly one of them is up. The final frame is the exception:
+ * playback and recording both finish on `duration` itself, so a layer written
+ * to run to the end would blink out for that last frame and the video would
+ * end on a blank. A layer that reaches the end of the composition therefore
+ * holds for that one frame.
+ */
+export function clipLive(clip, time, project) {
+  if (!clip || time < clip.start) return false;
+  if (time < clip.end) return true;
+  const duration = Number(project?.duration) || 0;
+  return clip.end >= duration - 1e-6 && time >= duration - 1e-6;
+}
+
+/**
+ * Split one effect across all three stages along its own arc — the shape a new
+ * layer starts with, and what a pre-stages project is read as.
+ */
+export function defaultStages(effectId, len, params = {}) {
+  const effect = EFFECTS[effectId] ? effectId : 'hold';
+  const [a, b] = effectArc(effect);
+  const span = Math.max(1e-4, len);
+  const copy = () => ({ ...params });
+  return {
+    in:  { effect, params: copy(), dur: span * a },
+    mid: { effect, params: copy() },
+    out: { effect, params: copy(), dur: span * (1 - b) }
+  };
 }
