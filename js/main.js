@@ -2,6 +2,7 @@
 
 import { state, clips, track, audioClips, savedAudioClips, audioClip, addAudioClip, removeAudioClip,
          initProject, on, emit, setTime, setDuration,
+         normalizeAudioVolumeKeys,
          syncBeatTimes, beatTimes, setMetro, setFont, fontSlots, fontsReady, select,
          fontAssets, registerFontAsset, setClipFont,
          selectCameraKey,
@@ -107,7 +108,9 @@ async function importAudio(file, kind = 'bgm', attachId = null, { handle = null,
 
     if (kind === 'bgm') {
       engine.setBuffer(kind, buffer);
-      Object.assign(tr, props);
+      Object.assign(tr, props, {
+        volumeKeys: normalizeAudioVolumeKeys(tr.volumeKeys, buffer.duration, tr.volume)
+      });
     } else {
       // Opening a project restores reference-only VO/SFX clips as pending.
       // Attaching from a saved clip's own button targets it by id; otherwise a
@@ -120,7 +123,9 @@ async function importAudio(file, kind = 'bgm', attachId = null, { handle = null,
         clip = addAudioClip(kind, { ...props, start: audioInsertStart(kind, buffer.duration) }, { notify: false });
         createdClip = true;
       } else {
-        Object.assign(clip, props);
+        Object.assign(clip, props, {
+          volumeKeys: normalizeAudioVolumeKeys(clip.volumeKeys, buffer.duration, clip.volume)
+        });
       }
       if (!clip) throw new Error(`Unknown audio lane: ${kind}`);
       engine.setBuffer(kind, buffer, clip.id);
@@ -225,7 +230,7 @@ function clearAudio(kind = 'bgm', id = null) {
   if (kind === 'bgm') {
     engine.clearTrack(kind);
     Object.assign(track(kind), {
-      name: '', duration: 0, peaks: null, start: 0, ready: false
+      name: '', duration: 0, peaks: null, start: 0, ready: false, volumeKeys: []
     });
     Object.assign(state.audio, {
       beats: [], onsets: [], onsetStrength: [], envelope: null, bpm: 0, offset: 0, hits: []
@@ -620,6 +625,7 @@ async function boot() {
     if (bgm.ready) {
       engine.setStart('bgm', bgm.start);
       engine.setLevel('bgm', { volume: bgm.volume, mute: bgm.mute });
+      engine.setVolumeKeys('bgm', bgm.volumeKeys);
     }
     for (const { kind } of TRACK_KINDS) {
       if (kind === 'bgm') continue;
@@ -627,6 +633,7 @@ async function boot() {
         if (!clip.ready) continue;
         engine.setStart(kind, clip.start, clip.id);
         engine.setLevel(kind, { volume: clip.volume, mute: clip.mute }, clip.id);
+        engine.setVolumeKeys(kind, clip.volumeKeys, clip.id);
       }
     }
   };
@@ -639,9 +646,13 @@ async function boot() {
     if (kind === 'bgm') {
       const bgm = track('bgm');
       engine.setLevel(kind, { volume: bgm.volume, mute: bgm.mute });
+      engine.setVolumeKeys(kind, bgm.volumeKeys);
     } else {
       const clip = audioClips(kind).find(c => c.id === id);
-      if (clip) engine.setLevel(kind, { volume: clip.volume, mute: clip.mute }, clip.id);
+      if (clip) {
+        engine.setLevel(kind, { volume: clip.volume, mute: clip.mute }, clip.id);
+        engine.setVolumeKeys(kind, clip.volumeKeys, clip.id);
+      }
     }
   });
   on('video videoMove videoLevel', () => {

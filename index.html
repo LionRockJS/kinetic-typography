@@ -175,7 +175,8 @@ tailwind.config = {
           <div id="audioLanes" class="space-y-1.5"></div>
           <p class="text-[10px] leading-relaxed text-zinc-600">
             BGM is one analysed source. Add as many voiceover or effects clips as you need;
-            each can be positioned and mixed independently on its lane.
+            each can be positioned and mixed independently on its lane. Double-click an audio
+            waveform to add a volume key, then drag its diamond vertically to automate the level.
           </p>
           <input id="audioFile" type="file" accept="audio/*" multiple class="hidden">
 
@@ -446,14 +447,14 @@ tailwind.config = {
       <div class="flex-1"></div>
 
       <div class="flex items-center gap-1.5 text-[10px] text-zinc-500">
-        <span class="hidden xl:inline text-zinc-600">drag point = move · drag end cap = stretch · ⇧ playhead snaps · ⇧ edits ignore snap</span>
+        <span class="hidden xl:inline text-zinc-600">drag point = move · drag end cap = stretch · scroll tracks · ⌘/Ctrl-wheel zoom · ⇧ playhead snaps · ⇧ edits ignore snap</span>
         <button id="btnZoomOut" class="btn btn-sq">−</button>
         <button id="btnZoomFit" class="btn !px-2">Fit</button>
         <button id="btnZoomIn" class="btn btn-sq">+</button>
       </div>
     </div>
-    <div class="relative">
-      <canvas id="timelineCanvas" class="block w-full cursor-default" style="height:220px"></canvas>
+    <div id="timelineViewport" class="timeline-scroll relative scroll-thin" aria-label="Timeline tracks">
+      <canvas id="timelineCanvas" class="block w-full cursor-default"></canvas>
       <div id="tlTip" class="hidden absolute z-10 px-1.5 py-0.5 rounded bg-black/85 border border-line text-[10px] font-mono text-zinc-200 pointer-events-none whitespace-nowrap"></div>
     </div>
   </footer>

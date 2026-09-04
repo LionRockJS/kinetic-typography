@@ -101,6 +101,22 @@ function finiteValue(value, fallback) {
   return Number.isFinite(Number(value)) ? Number(value) : fallback;
 }
 
+export const AUDIO_MAX_VOLUME = 1.5;
+
+export function normalizeAudioVolumeKeys(saved, duration, fallbackVolume = 1) {
+  const limit = Math.max(0, finiteValue(duration, 0));
+  const fallback = clamp(finiteValue(fallbackVolume, 1), 0, AUDIO_MAX_VOLUME);
+  return (Array.isArray(saved) ? saved : [])
+    .filter(key => key && typeof key === 'object')
+    .map(key => ({
+      id: typeof key.id === 'string' && key.id ? key.id : uid('avk'),
+      t: clamp(finiteValue(key.t, 0), 0, limit),
+      volume: clamp(finiteValue(key.volume, fallback), 0, AUDIO_MAX_VOLUME),
+      ease: EASES[key.ease] ? key.ease : 'smooth'
+    }))
+    .sort((a, b) => a.t - b.t);
+}
+
 function backdropValue(source = {}, fallback = BACKDROP_FALLBACKS) {
   const center = source.center && typeof source.center === 'object' ? source.center : {};
   return {
@@ -164,12 +180,19 @@ export function normalizeBackdrop(source, duration = 900, fallbackBg = BACKDROP_
 
 /** A decoded audio source positioned on an audio lane. */
 export function makeAudioClip(kind, props = {}) {
+  const source = props && typeof props === 'object' ? props : {};
+  const duration = Math.max(0, finiteValue(source.duration, 0));
+  const volume = clamp(finiteValue(source.volume, 1), 0, AUDIO_MAX_VOLUME);
   return {
     id: uid('a'), kind,
     name: '', size: 0, duration: 0, peaks: null, start: 0,
     transcript: '', words: [], speechStatus: 'idle', speechError: '',
-    volume: 1, mute: false, ready: false,
-    ...props,
+    volume, mute: false, ready: false, volumeKeys: [],
+    ...source,
+    duration,
+    volume,
+    volumeKeys: normalizeAudioVolumeKeys(
+      source.volumeKeys ?? source.volumeKeyframes, duration, volume),
     kind
   };
 }
@@ -268,7 +291,7 @@ export const state = {
   project: freshProject(),
   ui: {
     time: 0, playing: false, loop: false,
-    sel: null,                    // {type:'clip',id} | {type:'guide',level,id,ids} | {type:'camkey',id} | {type:'camera'} | {type:'backdrop'} | {type:'backdropkey',id} | {type:'particle',id} | {type:'particles'}
+    sel: null,                    // {type:'clip',id} | {type:'guide',level,id,ids} | {type:'camkey',id} | {type:'camera'} | {type:'backdrop'} | {type:'backdropkey',id} | {type:'particle',id} | {type:'particles'} | {type:'audio',kind,id?} | {type:'audioKey',kind,id,keyId}
     snap: true, snapGuides: true, snapPeaks: true, snapWords: true, safeArea: false,
     viewMode: 'output',           // 'output' = final camera, 'space' = 3D scene editor
     particle: null,               // id of the particle emitter being edited
@@ -524,6 +547,75 @@ export const savedAudioClips = kind => {
   return kind === 'bgm' ? (lane.ready || lane.name ? [lane] : []) : (lane.clips ?? []);
 };
 
+const savedAudioClip = (kind, id) => savedAudioClips(kind).find(clip => clip.id === id) ?? null;
+
+/** The volume keys authored inside one audio source, in local source seconds. */
+export function audioVolumeKeys(clipOrKind, id = null) {
+  const clip = typeof clipOrKind === 'string' ? savedAudioClip(clipOrKind, id) : clipOrKind;
+  return Array.isArray(clip?.volumeKeys) ? clip.volumeKeys : [];
+}
+
+export const audioVolumeKey = (kind, clipId, keyId) =>
+  audioVolumeKeys(savedAudioClip(kind, clipId)).find(key => key.id === keyId) ?? null;
+
+/** Evaluate one audio source's automated level at an absolute composition time. */
+export function audioVolumeAt(clip, time = state.ui.time) {
+  const base = clamp(finiteValue(clip?.volume, 1), 0, AUDIO_MAX_VOLUME);
+  const keys = audioVolumeKeys(clip)
+    .filter(key => key && Number.isFinite(Number(key.t)))
+    .slice()
+    .sort((a, b) => a.t - b.t);
+  if (!keys.length) return base;
+
+  const at = (Number.isFinite(Number(time)) ? Number(time) : 0) - (Number(clip?.start) || 0);
+  if (at < keys[0].t) return base;
+  if (at >= keys.at(-1).t) return clamp(finiteValue(keys.at(-1).volume, base), 0, AUDIO_MAX_VOLUME);
+
+  let i = 0;
+  while (i < keys.length - 1 && keys[i + 1].t <= at) i++;
+  const a = keys[i], b = keys[i + 1];
+  const span = Math.max(1e-6, b.t - a.t);
+  const raw = clamp((at - a.t) / span, 0, 1);
+  const u = (EASES[a.ease] ?? EASES.smooth).fn(raw);
+  return clamp(
+    finiteValue(a.volume, base) + (finiteValue(b.volume, base) - finiteValue(a.volume, base)) * u,
+    0, AUDIO_MAX_VOLUME);
+}
+
+/** The audio source or key currently selected in the timeline. */
+export const selectedAudioClip = () => {
+  const sel = state.ui.sel;
+  return sel?.kind && sel?.id ? savedAudioClip(sel.kind, sel.id) : null;
+};
+
+export const selectedAudioVolumeKey = () => {
+  const sel = state.ui.sel;
+  return sel?.type === 'audioKey' ? audioVolumeKey(sel.kind, sel.id, sel.keyId) : null;
+};
+
+export function selectAudioTrack(kind) {
+  if (!state.audio.tracks[kind]) return;
+  if (state.ui.sel?.type === 'audio' && state.ui.sel.kind === kind && !state.ui.sel.id) return;
+  state.ui.sel = { type: 'audio', kind };
+  emit('selection', state.ui.sel);
+}
+
+export function selectAudioClip(kind, id) {
+  if (!savedAudioClip(kind, id)) return null;
+  if (state.ui.sel?.type === 'audio' && state.ui.sel.kind === kind && state.ui.sel.id === id) return savedAudioClip(kind, id);
+  state.ui.sel = { type: 'audio', kind, id };
+  emit('selection', state.ui.sel);
+  return savedAudioClip(kind, id);
+}
+
+export function selectAudioVolumeKey(kind, clipId, keyId) {
+  const key = audioVolumeKey(kind, clipId, keyId);
+  if (!key) return null;
+  state.ui.sel = { type: 'audioKey', kind, id: clipId, keyId };
+  emit('selection', state.ui.sel);
+  return key;
+}
+
 export const anyAudio = () => Object.values(state.audio.tracks).some(lane =>
   lane.kind === 'bgm'
     ? lane.ready || !!lane.name || Number(lane.duration) > 0
@@ -571,8 +663,95 @@ export function setAudioClipLevel(kind, id, props) {
   if (kind === 'bgm') return setTrackLevel(kind, props);
   const clip = audioClip(kind, id);
   if (!clip) return;
-  Object.assign(clip, props);
+  if ('volume' in props) clip.volume = clamp(finiteValue(props.volume, clip.volume), 0, AUDIO_MAX_VOLUME);
+  if ('mute' in props) clip.mute = !!props.mute;
   emit('audioLevel', { kind, id, ...props });
+}
+
+/** Add or select a volume key at an absolute composition time. */
+export function addAudioVolumeKey(kind, id, time = state.ui.time) {
+  const clip = savedAudioClip(kind, id);
+  if (!clip) return null;
+  const duration = Math.max(0, finiteValue(clip.duration, 0));
+  const start = finiteValue(clip.start, 0);
+  const at = clamp(Number.isFinite(Number(time)) ? Number(time) : state.ui.time, start, start + duration);
+  const local = clamp(at - start, 0, duration);
+  const keys = audioVolumeKeys(clip);
+  const existing = keys.find(key => Math.abs(key.t - local) < 1e-3);
+  if (existing) {
+    selectAudioVolumeKey(kind, id, existing.id);
+    return existing;
+  }
+  const key = {
+    id: uid('avk'), t: local,
+    volume: audioVolumeAt(clip, at), ease: 'smooth'
+  };
+  keys.push(key);
+  keys.sort((a, b) => a.t - b.t);
+  selectAudioVolumeKey(kind, id, key.id);
+  emit('audioLevel', { kind, id, keyId: key.id });
+  emit('render');
+  return key;
+}
+
+/** Change one volume key's local time, level, or easing. */
+export function updateAudioVolumeKey(kind, clipId, keyId, props = {}) {
+  const clip = savedAudioClip(kind, clipId);
+  const key = audioVolumeKey(kind, clipId, keyId);
+  if (!clip || !key) return null;
+  const duration = Math.max(0, finiteValue(clip.duration, 0));
+  if ('t' in props) {
+    const value = Number(props.t);
+    if (Number.isFinite(value)) key.t = clamp(value, 0, duration);
+  }
+  if ('volume' in props) key.volume = clamp(finiteValue(props.volume, key.volume), 0, AUDIO_MAX_VOLUME);
+  if ('ease' in props) key.ease = EASES[props.ease] ? props.ease : 'smooth';
+  if ('t' in props) audioVolumeKeys(clip).sort((a, b) => a.t - b.t);
+  emit('audioLevel', { kind, id: clipId, keyId, ...props });
+  emit('render');
+  return key;
+}
+
+export function removeAudioVolumeKey(kind, clipId, keyId) {
+  const clip = savedAudioClip(kind, clipId);
+  if (!clip) return null;
+  const keys = audioVolumeKeys(clip);
+  const i = keys.findIndex(key => key.id === keyId);
+  if (i < 0) return null;
+  const [removed] = keys.splice(i, 1);
+  if (state.ui.sel?.type === 'audioKey' && state.ui.sel.kind === kind &&
+      state.ui.sel.id === clipId && state.ui.sel.keyId === keyId) {
+    const next = keys[Math.max(0, i - 1)] ?? keys[0];
+    state.ui.sel = next
+      ? { type: 'audioKey', kind, id: clipId, keyId: next.id }
+      : { type: 'audio', kind, id: clipId };
+    emit('selection', state.ui.sel);
+  }
+  emit('audioLevel', { kind, id: clipId, keyId });
+  emit('render');
+  return removed;
+}
+
+export function clearAudioVolumeKeys(kind, clipId) {
+  const clip = savedAudioClip(kind, clipId);
+  if (!clip) return null;
+  audioVolumeKeys(clip).length = 0;
+  if (state.ui.sel?.type === 'audioKey' && state.ui.sel.kind === kind && state.ui.sel.id === clipId) {
+    state.ui.sel = { type: 'audio', kind, id: clipId };
+    emit('selection', state.ui.sel);
+  }
+  emit('audioLevel', { kind, id: clipId });
+  emit('render');
+  return clip;
+}
+
+export function commitAudioVolumeKeys(kind, clipId) {
+  const clip = savedAudioClip(kind, clipId);
+  if (!clip) return null;
+  audioVolumeKeys(clip).sort((a, b) => a.t - b.t);
+  emit('audio', state.audio);
+  emit('render');
+  return clip;
 }
 
 export function removeAudioClip(kind, id) {
@@ -1036,7 +1215,8 @@ export function setTrackStart(kind, t) {
 export function setTrackLevel(kind, props) {
   const tr = track(kind);
   if (!tr) return;
-  Object.assign(tr, props);
+  if ('volume' in props) tr.volume = clamp(finiteValue(props.volume, tr.volume), 0, AUDIO_MAX_VOLUME);
+  if ('mute' in props) tr.mute = !!props.mute;
   emit('audioLevel', { kind, ...props });
 }
 
@@ -2186,6 +2366,8 @@ export function commitGuides(levelKey = null) {
 
 // ── serialisation (audio/video are referenced, never embedded) ─
 function serialAudioClip(clip) {
+  const duration = Math.max(0, serialNumber(clip.duration));
+  const volume = clamp(serialNumber(clip.volume, 1), 0, AUDIO_MAX_VOLUME);
   return {
     id: clip.id,
     name: clip.name,
@@ -2193,9 +2375,10 @@ function serialAudioClip(clip) {
     // the local media cache that reattaches the source on the next Open.
     size: Math.max(0, Number(clip.size) || 0),
     start: clip.start,
-    volume: clip.volume,
+    volume,
     mute: clip.mute,
-    duration: clip.duration,
+    duration,
+    volumeKeys: normalizeAudioVolumeKeys(clip.volumeKeys ?? clip.volumeKeyframes, duration, volume),
     transcript: typeof clip.transcript === 'string' ? clip.transcript : '',
     words: Array.isArray(clip.words)
       ? clip.words.map(word => ({
@@ -2262,7 +2445,7 @@ function restoreSpeechWords(saved, duration) {
 function restoreAudioClip(kind, saved = {}, durationLimit) {
   const source = saved && typeof saved === 'object' ? saved : {};
   const duration = Math.max(0, serialNumber(source.duration));
-  const volume = clamp(serialNumber(source.volume, 1), 0, 1.5);
+  const volume = clamp(serialNumber(source.volume, 1), 0, AUDIO_MAX_VOLUME);
   const words = restoreSpeechWords(source.words, duration);
   return makeAudioClip(kind, {
     id: typeof source.id === 'string' && source.id ? source.id : uid('a'),
@@ -2272,6 +2455,7 @@ function restoreAudioClip(kind, saved = {}, durationLimit) {
     start: clamp(serialNumber(source.start), -duration, durationLimit),
     volume,
     mute: source.mute === true,
+    volumeKeys: source.volumeKeys ?? source.volumeKeyframes,
     transcript: typeof source.transcript === 'string' ? source.transcript : '',
     words,
     speechStatus: words.length ? 'ready' : 'idle',
@@ -2362,7 +2546,7 @@ function restoreVideo(json, durationLimit) {
 
 // The on-disk contract, shared by Save, Open and the autosave snapshot.
 export const PROJECT_FORMAT = 'kinetic-typography-composer';
-export const PROJECT_VERSION = 13;
+export const PROJECT_VERSION = 14;
 
 export function serialize() {
   return {

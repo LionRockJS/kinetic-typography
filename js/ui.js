@@ -7,6 +7,8 @@ import { state, level, guides, clips, selectedClip, selectedClips, selectedClipI
          commitGuides, addClip, reframe,
          duplicateClip, removeClip, serialize, deserialize, track, audioClips, savedAudioClips, anyAudio,
          setTrackStart, setTrackLevel, setAudioClipStart, setAudioClipLevel,
+         AUDIO_MAX_VOLUME, audioVolumeKeys, selectedAudioVolumeKey, selectAudioVolumeKey, addAudioVolumeKey,
+         updateAudioVolumeKey, removeAudioVolumeKey, clearAudioVolumeKeys,
          setHitParams, syncBeatTimes,
          beatTimes, barTimes, setMetro, hasGrid, setRunPivot, runPivotIndex,
          videoClips, videoClip,
@@ -92,7 +94,7 @@ export function initUI(ctx) {
   on('history', syncHistoryButtons);
   on('guides duration', () => { renderPattern(); syncInspector(); });
   on('clips duration', () => { renderClipList(); syncInspector(); });
-  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); renderParticlePanel(true); renderBackdropPanel(); });
+  on('selection', () => { renderPattern(); renderClipList(); buildInspector(); renderCameraPanel(); renderParticlePanel(true); renderBackdropPanel(); renderAudioLanes(); });
   on('camera', renderCameraPanel);
   on('clip', () => { renderClipList(); syncInspector(); });
   on('audio audioMove audioLevel hits', syncAudioPanel);
@@ -106,7 +108,7 @@ export function initUI(ctx) {
   on('project', () => { renderStageText(); syncInspector(); });
   on('view', syncViewMode);
   on('time clips clip guides audioMove', syncTime);
-  on('time', () => { syncBackdropPreview(); syncInspector(); });
+  on('time', () => { syncBackdropPreview(); syncInspector(); syncAudioVolumeButtons(); });
 
   syncTopBar();
   syncHistoryButtons();
@@ -1802,6 +1804,86 @@ function buildAudioPanel() {
   renderAudioLanes();
 }
 
+function renderAudioVolumePanel(meta, clip) {
+  const keys = audioVolumeKeys(clip);
+  const active = selectedAudioVolumeKey();
+  const inside = clip.duration > 0 && state.ui.time >= clip.start - 1e-6 &&
+    state.ui.time <= clip.start + clip.duration + 1e-6;
+  const keyList = el('div', { class: 'space-y-1' });
+
+  if (!keys.length) {
+    keyList.append(el('div', { class: 'text-[9px] text-zinc-600' },
+      'No volume keys — the base level stays constant.'));
+  } else {
+    keys.forEach((key, index) => {
+      const selected = active?.id === key.id &&
+        state.ui.sel?.kind === meta.kind && state.ui.sel?.id === clip.id;
+      keyList.append(el('div', {
+        class: 'flex items-center gap-1 rounded border px-1.5 py-1 ' +
+          (selected ? 'border-zinc-300/60 bg-base-600' : 'border-line bg-base-900'),
+        onClick: () => { selectAudioVolumeKey(meta.kind, clip.id, key.id); app.timeline.draw(); }
+      },
+        el('span', {
+          class: 'w-3 h-3 rotate-45 shrink-0 border border-black/60',
+          style: { background: selected ? '#f4f7fb' : meta.kind === 'bgm' ? '#5fb3e6' : meta.kind === 'vo' ? '#63c497' : '#b18fe0' },
+          title: `Volume key ${index + 1}`
+        }),
+        el('input', {
+          type: 'number', step: '0.05', min: 0, max: Math.max(0, clip.duration),
+          value: round(key.t, 2), title: 'Time inside this audio source',
+          class: 'inp !w-[62px] !py-0.5 !text-[10px] font-mono text-center',
+          onClick: e => e.stopPropagation(),
+          onChange: e => {
+            updateAudioVolumeKey(meta.kind, clip.id, key.id, { t: +e.target.value || 0 });
+            e.target.blur();
+            renderAudioLanes();
+            app.timeline.draw();
+          }
+        }),
+        el('span', { class: 'text-[9px] text-zinc-600' }, 's'),
+        el('input', {
+          type: 'number', step: '0.05', min: 0, max: AUDIO_MAX_VOLUME,
+          value: round(key.volume, 2), title: 'Volume multiplier',
+          class: 'inp flex-1 min-w-0 !py-0.5 !text-[10px] font-mono text-right',
+          onClick: e => e.stopPropagation(),
+          onInput: e => { updateAudioVolumeKey(meta.kind, clip.id, key.id, { volume: e.target.value }); app.timeline.draw(); },
+          onBlur: () => renderAudioLanes()
+        }),
+        el('select', {
+          class: 'sel !w-[70px] !py-0.5 !text-[10px]', title: 'Easing out of this volume key',
+          onClick: e => e.stopPropagation(),
+          onChange: e => { updateAudioVolumeKey(meta.kind, clip.id, key.id, { ease: e.target.value }); app.timeline.draw(); }
+        }, ...Object.entries(EASES).map(([id, ease]) =>
+          el('option', { value: id, selected: key.ease === id }, ease.label))),
+        el('button', {
+          class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Delete this volume key',
+          onClick: e => { e.stopPropagation(); removeAudioVolumeKey(meta.kind, clip.id, key.id); app.timeline.draw(); }
+        }, '✕')
+      ));
+    });
+  }
+
+  return el('div', { class: 'pt-1.5 border-t border-line/70 space-y-1.5' },
+    el('div', { class: 'flex items-center gap-1.5' },
+      el('span', { class: 'text-[10px] uppercase tracking-wider text-zinc-500 flex-1' }, 'Volume automation'),
+      el('span', { class: 'chip' }, `${keys.length} key${keys.length === 1 ? '' : 's'}`),
+      el('button', {
+        class: 'btn !px-1.5 !py-1 !text-[10px]', disabled: !inside,
+        'data-audio-volume-add': '',
+        'data-audio-volume-start': clip.start,
+        'data-audio-volume-end': clip.start + clip.duration,
+        title: inside ? 'Add or select a volume key at the playhead' : 'Move the playhead inside this audio source first',
+        onClick: () => { addAudioVolumeKey(meta.kind, clip.id, state.ui.time); app.timeline.draw(); renderAudioLanes(); }
+      }, '+ Keyframe'),
+      keys.length ? el('button', {
+        class: 'btn !px-1.5 !py-1 !text-[10px] hover:!text-red-400', title: 'Remove all volume keys from this source',
+        onClick: () => { clearAudioVolumeKeys(meta.kind, clip.id); app.timeline.draw(); }
+      }, 'Clear') : null
+    ),
+    keyList
+  );
+}
+
 function renderAudioLanes() {
   const host = $('#audioLanes');
   if (!host || holdsFocus(host)) return;      // a fader is being driven — leave it be
@@ -1882,6 +1964,7 @@ function renderAudioLanes() {
             onClick: () => app.clearAudio(meta.kind, isBgm ? null : clip.id)
           }, '✕')
         ));
+        controls.append(renderAudioVolumePanel(meta, clip));
         return controls;
       }
       if (!isBgm) {
@@ -1921,7 +2004,7 @@ function renderAudioLanes() {
       }
       controls.append(el('div', { class: 'flex items-center gap-1.5' },
         el('input', {
-          type: 'range', min: 0, max: 1.5, step: 0.01, value: clip.volume, class: 'flex-1',
+          type: 'range', min: 0, max: AUDIO_MAX_VOLUME, step: 0.01, value: clip.volume, class: 'flex-1',
           title: `${meta.label} level`,
           onInput: e => isBgm
             ? setTrackLevel(meta.kind, { volume: +e.target.value })
@@ -1940,6 +2023,7 @@ function renderAudioLanes() {
           }
         }),
         el('span', { class: 'text-[9px] text-zinc-600' }, 's')));
+      controls.append(renderAudioVolumePanel(meta, clip));
       return controls;
     });
 
@@ -1991,6 +2075,19 @@ function syncAudioPanel() {
   $('#hitSense').value = a.hitSense;
   $('#tSnapPeaks').checked = state.ui.snapPeaks;
   syncPeakLabels();
+}
+
+function syncAudioVolumeButtons() {
+  const t = state.ui.time;
+  for (const button of document.querySelectorAll('[data-audio-volume-add]')) {
+    const start = Number(button.getAttribute('data-audio-volume-start'));
+    const end = Number(button.getAttribute('data-audio-volume-end'));
+    const inside = Number.isFinite(start) && Number.isFinite(end) && t >= start - 1e-6 && t <= end + 1e-6;
+    button.disabled = !inside;
+    button.title = inside
+      ? 'Add or select a volume key at the playhead'
+      : 'Move the playhead inside this audio source first';
+  }
 }
 
 // ══ metronome ════════════════════════════════════════════════
@@ -2775,6 +2872,7 @@ function renderParticlePanel(force = false) {
     sl('Size', 'size', 0.5, 120, 0.5),
     curveEditor('Size over life', s.sizeOverLife, values => set({ sizeOverLife: values })),
     sl('Speed', 'speed', 0, 2000, 5),
+    sl('Motion blur', 'motionBlur', 0, 0.25, 0.005, 'shutter seconds'),
     directional ? sl('Direction', 'direction', 0, 360, 1, 'degrees') : null,
     sl('Spread', 'spread', 0, 1, 0.01),
     sl('Gravity', 'gravity', -1500, 1500, 5),
@@ -3066,7 +3164,14 @@ function buildShortcuts() {
       }
       case 'Backspace': case 'Delete': {
         const ck = selectedCamKey();
+        const avk = selectedAudioVolumeKey();
         if (ck) { e.preventDefault(); removeCameraKey(ck.id, selectedCamAxis()); app.timeline.draw(); }
+        else if (avk) {
+          e.preventDefault();
+          const sel = state.ui.sel;
+          removeAudioVolumeKey(sel.kind, sel.id, sel.keyId);
+          app.timeline.draw();
+        }
         else if (selectedBackdropKey()) {
           e.preventDefault();
           removeBackdropKey(selectedBackdropKey().id);

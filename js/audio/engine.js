@@ -11,6 +11,8 @@
 // the clock falls back to performance.now() whenever the context is not running
 // and re-bases itself when the source changes mid-playback.
 
+import { easeFn } from '../camera.js';
+
 export const TRACK_KINDS = [
   { kind: 'bgm', label: 'Music',  short: 'BGM', analysed: true },
   { kind: 'vo',  label: 'Voice',  short: 'VO',  analysed: false },
@@ -27,7 +29,7 @@ export class AudioEngine {
     this._t0 = 0;             // clock reading at that moment
     this._audioClock = false; // which clock _t0 was read from
 
-    /** @type {Map<string, Map<string, {buffer:AudioBuffer|null, gain:GainNode|null, source:AudioBufferSourceNode|null, start:number, volume:number, mute:boolean}>>} */
+    /** @type {Map<string, Map<string, {buffer:AudioBuffer|null, gain:GainNode|null, source:AudioBufferSourceNode|null, start:number, volume:number, mute:boolean, volumeKeys:Array<{t:number,volume:number,ease:string}>}>>} */
     this.tracks = new Map(
       TRACK_KINDS.map(t => [t.kind, new Map()])
     );
@@ -85,7 +87,12 @@ export class AudioEngine {
     if (!lane) return null;
     const key = id ?? (kind === 'bgm' ? 'bgm' : null);
     if (key === null) return null;
-    if (!lane.has(key)) lane.set(key, { buffer: null, gain: null, source: null, start: 0, volume: 1, mute: false });
+    if (!lane.has(key)) {
+      lane.set(key, {
+        buffer: null, gain: null, source: null, start: 0,
+        volume: 1, mute: false, volumeKeys: []
+      });
+    }
     return lane.get(key);
   }
 
@@ -101,15 +108,81 @@ export class AudioEngine {
     const tr = this._ensureTrack(kind, id);
     if (!tr) return;
     tr.start = t;
+    if (tr.gain && this.playing) this._scheduleGain(tr, this.now());
   }
 
   setLevel(kind, { volume, mute }, id = null) {
     const tr = this._ensureTrack(kind, id);
     if (!tr) return;
-    if (volume !== undefined) tr.volume = volume;
+    if (volume !== undefined && Number.isFinite(Number(volume))) {
+      tr.volume = Math.max(0, Math.min(1.5, Number(volume)));
+    }
     if (mute !== undefined) tr.mute = mute;
     if (!tr.gain && this.ctx) this._ensureCtx();
-    if (tr.gain) tr.gain.gain.value = tr.mute ? 0 : tr.volume;
+    if (tr.gain) this._scheduleGain(tr, this.playing ? this.now() : this._base);
+  }
+
+  /** Keep the runtime automation copy aligned with the serialisable clip. */
+  setVolumeKeys(kind, keys = [], id = null) {
+    const tr = this._ensureTrack(kind, id);
+    if (!tr) return;
+    tr.volumeKeys = (Array.isArray(keys) ? keys : [])
+      .filter(key => key && Number.isFinite(Number(key.t)) && Number.isFinite(Number(key.volume)))
+      .map(key => ({
+        t: Math.max(0, Number(key.t)),
+        volume: Math.max(0, Math.min(1.5, Number(key.volume))),
+        ease: typeof key.ease === 'string' ? key.ease : 'smooth'
+      }))
+      .sort((a, b) => a.t - b.t);
+    if (tr.gain) this._scheduleGain(tr, this.playing ? this.now() : this._base);
+  }
+
+  _volumeAt(tr, compositionTime) {
+    const base = Math.max(0, Math.min(1.5, Number(tr.volume) || 0));
+    const keys = tr.volumeKeys ?? [];
+    if (!keys.length) return base;
+    const at = compositionTime - (Number(tr.start) || 0);
+    if (at < keys[0].t) return base;
+    if (at >= keys.at(-1).t) return keys.at(-1).volume;
+
+    let i = 0;
+    while (i < keys.length - 1 && keys[i + 1].t <= at) i++;
+    const a = keys[i], b = keys[i + 1];
+    const u = Math.max(0, Math.min(1, (at - a.t) / Math.max(1e-6, b.t - a.t)));
+    const eased = easeFn(a.ease)(u);
+    return a.volume + (b.volume - a.volume) * eased;
+  }
+
+  /** Schedule the current level and all future volume keys without clicks. */
+  _scheduleGain(tr, compositionTime) {
+    if (!tr.gain || !this.ctx) return;
+    const param = tr.gain.gain;
+    const now = this.ctx.currentTime;
+    const current = tr.mute ? 0 : this._volumeAt(tr, compositionTime);
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(current, now);
+    if (tr.mute) return;
+
+    const keys = tr.volumeKeys ?? [];
+    const future = keys.filter(key => (Number(tr.start) || 0) + key.t > compositionTime + 1e-6);
+    let fromTime = compositionTime;
+    let fromValue = current;
+    let previous = keys.filter(key => (Number(tr.start) || 0) + key.t <= compositionTime + 1e-6).at(-1) ?? null;
+    for (const key of future) {
+      const keyTime = (Number(tr.start) || 0) + key.t;
+      const seconds = keyTime - fromTime;
+      if (seconds <= 1e-6) continue;
+      const steps = Math.min(32, Math.max(2, Math.ceil(seconds * 60)));
+      const ease = easeFn(previous?.ease ?? 'smooth');
+      for (let i = 1; i <= steps; i++) {
+        const u = i / steps;
+        const value = fromValue + (key.volume - fromValue) * ease(u);
+        param.linearRampToValueAtTime(value, now + (seconds * u + fromTime - compositionTime));
+      }
+      fromTime = keyTime;
+      fromValue = key.volume;
+      previous = key;
+    }
   }
 
   /** Return a fresh mono copy of a loaded source for speech analysis. */
@@ -142,6 +215,7 @@ export class AudioEngine {
         if (!tr.buffer) continue;
         const at = this._base - tr.start;              // position inside this buffer
         if (at >= tr.buffer.duration) continue;
+        this._scheduleGain(tr, this._base);
         const src = ctx.createBufferSource();
         src.buffer = tr.buffer;
         src.connect(tr.gain);

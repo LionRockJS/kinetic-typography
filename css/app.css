@@ -1,6 +1,11 @@
 /* Kinetic Typography Composer — chrome that Tailwind does not cover */
 
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  /* The canvas can be taller than this viewport; adjust this value to give
+     the timeline more or less screen space without changing its track layout. */
+  --timeline-viewport-height: clamp(220px, 34vh, 360px);
+}
 
 html, body { height: 100%; }
 body { -webkit-font-smoothing: antialiased; }
@@ -91,6 +96,17 @@ input[type="number"] { -moz-appearance: textfield; }
 .is-recording { animation: recpulse 1s ease-in-out infinite; }
 
 #timelineCanvas { touch-action: none; }
+
+/* Keep the editor body usable when optional media lanes or particle emitters
+   make the timeline content taller than the available timeline viewport. */
+.timeline-scroll {
+  height: var(--timeline-viewport-height);
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
 
 /* ── viewport mode switch ────────────────────────────────── */
 .view-mode-active {

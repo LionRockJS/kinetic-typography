@@ -25,6 +25,7 @@
 //   drag a stage handle       → set how long the selected layer's in or out
 //                               stage runs; mid keeps the rest
 //   drag a colour key         → retime a colour change inside its text block
+//   double-click an audio clip → add a volume key · drag its diamond in time or level
 //   drag a particle block     → move its live window · drag an edge to trim
 //   double-click a track      → new clip in that phase
 //   double-click a text block → add a colour key at that time
@@ -39,12 +40,14 @@ import { state, level, guides, clips, audioClips, savedAudioClips, audioClip, an
          updateCameraKey, updateCameraChannelKey,
          setRunPivot, runPivotIndex, setAudioClipStart, setVideoClipStart, beatTimes, barTimes,
          voiceWordTimes,
+         audioVolumeKeys, audioVolumeKey, audioVolumeAt, selectAudioTrack, selectAudioClip,
+         selectAudioVolumeKey, addAudioVolumeKey, updateAudioVolumeKey, commitAudioVolumeKeys,
          particleEmitters, particleEmitter, selectEmitter, activeEmitterId, addParticleEmitter,
          selectParticleTrack, setEmitterWindow, commitEmitters, setStageDuration,
          clipColorKey, selectClipColorKey, addClipColorKey, updateClipColorKey,
          backdrop, backdropKeys, backdropKey, selectBackdropKey, selectBackdropTrack,
          addBackdropKey, updateBackdropKey, commitBackdropKeys, backdropAt, sampleBackdrop,
-         emit, TRACKS, MIN_CLIP } from './state.js';
+         emit, TRACKS, MIN_CLIP, AUDIO_MAX_VOLUME } from './state.js';
 import { stageWindows } from './effects.js';
 import { TRACK_KINDS } from './audio/engine.js';
 import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
@@ -97,6 +100,7 @@ const EDGE = 7;
 const STAGE_EDGE = 4;         // grab radius of an in/out stage handle
 const BACKDROP_KEY_HIT = 9;
 const COLOR_KEY_HIT = 8;
+const AUDIO_KEY_HIT = 9;
 
 /** in › mid › out on the block, collapsed to one word when they agree. */
 const stageNames = c =>
@@ -144,8 +148,8 @@ export class Timeline {
     if (hasAudio) {
       y += 2;
       y = setLane('bgm', y, 32) + 2;
-      y = setLane('vo', y, 20) + 2;
-      y = setLane('sfx', y, 20);
+      y = setLane('vo', y, 28) + 2;
+      y = setLane('sfx', y, 28);
     }
 
     y += 4;
@@ -206,6 +210,16 @@ export class Timeline {
   trackAt(y) {
     const i = Math.floor((y - TRACK_TOP) / (TRACK_H + TRACK_GAP));
     return i >= 0 && i < TRACKS ? i : -1;
+  }
+  audioVolumeY(volume, y0, y1) {
+    const pad = Math.min(4, Math.max(1, (y1 - y0) / 4));
+    const span = Math.max(1, y1 - y0 - pad * 2);
+    return y1 - pad - clamp(Number(volume) || 0, 0, AUDIO_MAX_VOLUME) / AUDIO_MAX_VOLUME * span;
+  }
+  audioVolumeFromY(py, y0, y1) {
+    const pad = Math.min(4, Math.max(1, (y1 - y0) / 4));
+    const span = Math.max(1, y1 - y0 - pad * 2);
+    return clamp((y1 - pad - py) / span * AUDIO_MAX_VOLUME, 0, AUDIO_MAX_VOLUME);
   }
 
   resize() {
@@ -400,6 +414,15 @@ export class Timeline {
       for (let i = lane.length - 1; i >= 0; i--) {
         const clip = lane[i];
         if (clip.ready && px >= this.x(clip.start) && px <= this.x(clip.start + clip.duration)) {
+          const keys = audioVolumeKeys(clip);
+          for (let k = keys.length - 1; k >= 0; k--) {
+            const key = keys[k];
+            const xk = this.x(clip.start + (Number(key.t) || 0));
+            const yk = this.audioVolumeY(key.volume, y0, y1);
+            if (Math.abs(px - xk) <= AUDIO_KEY_HIT && Math.abs(py - yk) <= AUDIO_KEY_HIT) {
+              return { type: 'audioVolumeKey', kind, id: clip.id, keyId: key.id };
+            }
+          }
           return { type: 'audio', kind, id: clip.id };
         }
       }
@@ -519,10 +542,26 @@ export class Timeline {
       const clip = videoClip(hit.kind, hit.id);
       if (!clip) return;
       this.drag = { type: 'video', kind: hit.kind, id: hit.id, grab: this.t(px) - clip.start };
+    } else if (hit.type === 'audioVolumeKey') {
+      const clip = audioClip(hit.kind, hit.id);
+      const key = audioVolumeKey(hit.kind, hit.id, hit.keyId);
+      if (!clip || !key) return;
+      selectAudioVolumeKey(hit.kind, hit.id, hit.keyId);
+      this.drag = {
+        type: 'audioVolumeKey', kind: hit.kind, id: hit.id, keyId: hit.keyId,
+        grab: this.t(px) - (clip.start + key.t),
+        grabY: py - this.audioVolumeY(key.volume, LANE[hit.kind][0], LANE[hit.kind][1])
+      };
     } else if (hit.type === 'audio') {
       const clip = audioClip(hit.kind, hit.id);
       if (!clip) return;
+      selectAudioClip(hit.kind, hit.id);
       this.drag = { type: 'audio', kind: hit.kind, id: hit.id, grab: this.t(px) - clip.start };
+    } else if (hit.type === 'audioLane') {
+      selectAudioTrack(hit.kind);
+      this.drag = { type: 'scrub' };
+      const raw = this.t(px);
+      emit('seek', e.shiftKey ? this.snap(raw).t : raw);
     } else if (hit.type === 'particle') {
       const e = particleEmitter(hit.id);
       if (!e) return;
@@ -609,6 +648,7 @@ export class Timeline {
         : hit.type === 'particle' ? (hit.edge ? 'ew-resize' : 'grab')
         : hit.type === 'particleLane' ? 'copy'
         : hit.type === 'video' ? (this.drag ? 'grabbing' : 'grab')
+        : hit.type === 'audioVolumeKey' ? 'move'
         : hit.type === 'audio' ? (this.drag ? 'grabbing' : 'grab')
         : hit.type === 'audioLane' ? 'default'
         : hit.type === 'videoLane' ? 'default'
@@ -677,6 +717,19 @@ export class Timeline {
       setVideoClipStart(d.kind, d.id, t);
       this._tip(`${VIDEO_KIND[d.kind].short} · starts ${fmtTime(Math.max(0, t))}${t < 0 ? '  (trimmed in)' : ''}${kind ? '  ⟡' + kind : ''}`,
                 px, LANE[d.kind][0]);
+
+    } else if (d.type === 'audioVolumeKey') {
+      const clip = audioClip(d.kind, d.id);
+      const key = audioVolumeKey(d.kind, d.id, d.keyId);
+      const lane = LANE[d.kind];
+      if (!clip || !key || !lane) return;
+      const { t, kind } = this.snap(this.t(px) - d.grab, { ignore: free });
+      const local = clamp(t - clip.start, 0, Math.max(0, clip.duration));
+      const volume = this.audioVolumeFromY(py - d.grabY, lane[0], lane[1]);
+      updateAudioVolumeKey(d.kind, d.id, d.keyId, { t: local, volume });
+      const live = audioVolumeKey(d.kind, d.id, d.keyId);
+      this._tip(`${KIND[d.kind].short} · volume ${Math.round((live?.volume ?? volume) * 100)}% · ${fmtTime(clip.start + (live?.t ?? local))}${kind ? '  ⟡' + kind : ''}`,
+                px, lane[0]);
 
     } else if (d.type === 'audio') {
       const clip = audioClip(d.kind, d.id);
@@ -857,6 +910,7 @@ export class Timeline {
     this.drag = null;
     this._tip(null);
     if (d.type === 'video') emit('video', state.video);
+    else if (d.type === 'audioVolumeKey') commitAudioVolumeKeys(d.kind, d.id);
     else if (d.type === 'audio') emit('audio', state.audio);   // resyncs playback and the panel
     else if (d.type === 'backdropkey') commitBackdropKeys();
     else if (d.type === 'end') setDuration(state.project.duration, { scale: false });
@@ -897,8 +951,17 @@ export class Timeline {
   }
 
   onWheel(e) {
-    e.preventDefault();
     const { px } = this._pos(e);
+    const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX) && !e.shiftKey;
+    const viewport = this.canvas.parentElement;
+    const canScrollVertically = viewport && viewport.scrollHeight > viewport.clientHeight;
+
+    // Let the timeline viewport consume a normal vertical wheel when its
+    // content is taller than the visible area. Ctrl/Cmd + wheel remains an
+    // explicit zoom gesture; horizontal and shift-wheel input still pans.
+    if (vertical && canScrollVertically && !e.ctrlKey && !e.metaKey) return;
+
+    e.preventDefault();
     if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       const dt = (e.deltaX || e.deltaY) / this.pxPerSec;
       const max = this.viewMax;
@@ -922,6 +985,19 @@ export class Timeline {
     }
     if (hit.type === 'backdropLane') {
       addBackdropKey(this.snap(hit.t).t);
+      this.draw();
+      return;
+    }
+    if (hit.type === 'audioVolumeKey') {
+      selectAudioVolumeKey(hit.kind, hit.id, hit.keyId);
+      this.draw();
+      return;
+    }
+    if (hit.type === 'audio') {
+      const clip = audioClip(hit.kind, hit.id);
+      if (!clip) return;
+      const at = clamp(this.snap(this.t(px)).t, clip.start, clip.start + clip.duration);
+      addAudioVolumeKey(hit.kind, hit.id, at);
       this.draw();
       return;
     }
@@ -1288,12 +1364,12 @@ export class Timeline {
       return;
     }
 
-    for (const clip of pending) this._drawPendingAudioClip(g, clip, y0, y1);
+    for (const clip of pending) this._drawPendingAudioClip(g, kind, clip, y0, y1);
     for (const clip of lane) this._drawAudioClip(g, kind, clip, y0, y1);
   }
 
   /** A saved-but-unattached clip: outline only, so its timing stays visible. */
-  _drawPendingAudioClip(g, clip, y0, y1) {
+  _drawPendingAudioClip(g, kind, clip, y0, y1) {
     const h = y1 - y0;
     const rx0 = this.x(clip.start);
     const rx1 = Math.max(rx0 + 40, this.x(clip.start + Math.max(0, clip.duration)));
@@ -1310,6 +1386,49 @@ export class Timeline {
     g.font = '9px ui-monospace, monospace';
     g.textAlign = 'left'; g.textBaseline = 'top';
     g.fillText(`○ ${clip.name || 'unattached'} · re-import`, rx0 + 6, y0 + 4);
+    this._drawAudioVolumeEnvelope(g, kind, clip, y0, y1, ['#3b4657', '#7a879b']);
+    g.restore();
+  }
+
+  _drawAudioVolumeEnvelope(g, kind, clip, y0, y1, tint) {
+    const keys = audioVolumeKeys(clip);
+    if (!keys.length || clip.duration <= 0) return;
+    const rx0 = this.x(clip.start), rx1 = this.x(clip.start + clip.duration);
+    const from = Math.max(0, Math.floor(rx0));
+    const to = Math.min(this.w, Math.ceil(rx1));
+    if (to < from) return;
+
+    g.save();
+    g.strokeStyle = tint[1];
+    g.globalAlpha = clip.mute ? 0.35 : 0.9;
+    g.lineWidth = 1.5;
+    g.lineJoin = 'round';
+    g.beginPath();
+    for (let px = from; px <= to; px++) {
+      const x = px;
+      const y = this.audioVolumeY(audioVolumeAt(clip, this.t(px)), y0, y1);
+      if (px === from) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+
+    for (const key of keys) {
+      const x = this.x(clip.start + key.t);
+      if (x < -AUDIO_KEY_HIT || x > this.w + AUDIO_KEY_HIT) continue;
+      const y = this.audioVolumeY(key.volume, y0, y1);
+      const selected = state.ui.sel?.type === 'audioKey' && state.ui.sel.kind === kind &&
+        state.ui.sel.id === clip.id && state.ui.sel.keyId === key.id;
+      const hovered = this.hover?.type === 'audioVolumeKey' && this.hover.kind === kind &&
+        this.hover.id === clip.id && this.hover.keyId === key.id;
+      const r = selected || hovered ? 5 : 4;
+      g.globalAlpha = clip.mute ? 0.45 : 1;
+      g.fillStyle = selected ? '#f4f7fb' : tint[1];
+      g.beginPath();
+      g.moveTo(x, y - r); g.lineTo(x + r, y); g.lineTo(x, y + r); g.lineTo(x - r, y);
+      g.closePath(); g.fill();
+      g.strokeStyle = hovered || selected ? '#f4f7fb' : '#0d0f14';
+      g.lineWidth = selected || hovered ? 1.5 : 1;
+      g.stroke();
+    }
     g.restore();
   }
 
@@ -1388,6 +1507,8 @@ export class Timeline {
       }
       g.stroke();
     }
+
+    this._drawAudioVolumeEnvelope(g, kind, clip, y0, y1, tint);
 
     g.fillStyle = hot ? '#9fd4f5' : '#4e6b85';
     g.font = '9px ui-monospace, monospace';

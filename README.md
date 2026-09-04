@@ -21,7 +21,7 @@ the optional speech runtime/model only when VO analysis is requested.
 | Text layers | 3 tracks, unlimited simultaneous clips, 20 effects, per-clip typeface / weight, 3D position, parent/child offsets, beat reaction, and colour keyframes |
 | Camera | keyframed 3D position / roll with easing, on its own track |
 | Backdrop colour | solid, linear / circular / 4-point gradients with colour keyframes |
-| Audio | 3 lanes (BGM · VO · SFX), each slippable, with level, mute, and optional VO word timing |
+| Audio | 3 lanes (BGM · VO · SFX), each slippable, with level, mute, volume keyframes, and optional VO word timing |
 | Backdrop video | 3 visual channels, each holding multiple clips with independent timing, opacity / fit / loop / mask / In-Out fades |
 | Beat analysis | STFT → spectral flux → adaptive peaks → autocorrelation tempo → phase-locked grid |
 | Peaks | transient detection with spacing and sensitivity thresholds, snappable |
@@ -41,9 +41,9 @@ downbeat phase correct to within a frame. On a 120 BPM import the app read
 - Audio and backdrop settings are retained in a saved project, but their source
   files are referenced by name rather than embedded, so sources must be
   re-imported after opening a file.
-- The timeline collapses unused audio and backdrop video lanes: it is about 258 px
-  with neither loaded and grows to ~428 px when every media lane is visible;
-  on a short screen the stage viewport gets tight.
+- The timeline collapses unused audio and backdrop video lanes, and its content
+  scrolls vertically inside a responsive viewport (220–360 px depending on
+  screen height). Adjust `--timeline-viewport-height` in `css/app.css` if needed.
 - BGM is one analysed source; VO and SFX lanes can contain multiple independent clips.
 - VO word timing is model-based and approximate; review the waveform and adjust
   the text clip edges when a word is misrecognised or a pause is ambiguous.
@@ -201,7 +201,11 @@ Every audio file is a region on the timeline: grab its waveform to slip it
 earlier or later, snapping to guides, bars, beats and peaks. Drag one left of
 zero to trim into it. Each file has a numeric start, a level fader and a mute;
 the **Add voice…** and **Add effects…** buttons append another clip to their
-lane, ready to be positioned independently.
+lane, ready to be positioned independently. Double-click a waveform to add a
+volume key at that point, drag its diamond vertically to change the level or
+horizontally to retime it, and edit the exact local time, multiplier, or easing
+in the Volume automation list. Keys are local to their source, so slipping a
+clip keeps its automation attached.
 
 Voice clips have an **Analyse words** control. It runs a quantised
 `Xenova/whisper-tiny` speech model in a worker in the browser, returning word
@@ -354,6 +358,8 @@ used for full-size preview and recording.
 | double-click a track | new layer filling that phase |
 | double-click inside a clip | add a colour key at that time |
 | drag a colour key | retime the colour change inside its clip |
+| double-click an audio waveform | add a volume key at that time |
+| drag a volume key | retime it horizontally or change its level vertically |
 | drag a backdrop video clip | slip that clip earlier or later |
 | drag a waveform | slip that lane earlier or later (left of zero trims in) |
 | no audio or backdrop video loaded | the unused media lanes collapse to save space |
@@ -561,9 +567,11 @@ embedded — only the names needed to re-attach them.
   "audio": {                       // null when nothing is loaded
     "bpm": 120.1, "offset": 0, "beatsPerBar": 4, "hitGap": 0.35, "hitSense": 0.2,
     "tracks": {
-      "bgm": { "name": "song.wav", "start": 0, "volume": 1, "mute": false, "duration": 16 },
+      "bgm": { "name": "song.wav", "start": 0, "volume": 1, "mute": false, "duration": 16,
+               "volumeKeys": [{ "t": 0, "volume": 0.7, "ease": "smooth" }] },
       "vo": { "clips": [
-        { "name": "intro.wav", "start": 0, "volume": 1, "mute": false, "duration": 2.4 },
+        { "name": "intro.wav", "start": 0, "volume": 1, "mute": false, "duration": 2.4,
+          "volumeKeys": [{ "t": 1.2, "volume": 0.8, "ease": "linear" }] },
         { "name": "line-2.wav", "start": 3.1, "volume": 1, "mute": false, "duration": 1.8 }
       ] },
       "sfx": { "clips": [] }

@@ -147,6 +147,8 @@ export function makeEmitter(props = {}, { duration = 24 } = {}) {
     spin: num(s.spin, 0.6, 0, 12),
 
     speed: num(s.speed, 90, 0, 2000),
+    // Shutter duration in seconds. Zero keeps the original crisp point sprite.
+    motionBlur: num(s.motionBlur, 0, 0, 0.25),
     direction: num(s.direction, 90, 0, 360),  // degrees, 0 = +x
     spread: num(s.spread, 1, 0, 1),           // 1 = a full circle
     gravity: num(s.gravity, -40, -1500, 1500),
@@ -191,18 +193,36 @@ attribute float aSize;
 attribute float aAge;
 attribute float aRot;
 attribute float aAlpha;
+attribute vec3 aVelocity;
 uniform float uScale;
+uniform float uMotionBlur;
 varying float vAge;
 varying float vRot;
 varying float vAlpha;
 varying float vAA;
+varying vec2 vMotionDir;
+varying float vMotionAmount;
+varying float vBodyScale;
 void main() {
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * mv;
-  float px = max(1.0, aSize * uScale / max(-mv.z, 1.0));
-  gl_PointSize = px;
+  float depth = max(-mv.z, 1.0);
+  float sizePx = max(1.0, aSize * uScale / depth);
+
+  // The velocity is in scene units per second. Project it into view space so
+  // blur follows the particle on screen even when the authored camera rolls or
+  // the editor camera is orbiting the scene. Keep the cap conservative: a
+  // large point sprite is much more expensive than a small one.
+  vec3 mvVelocity = (modelViewMatrix * vec4(aVelocity, 0.0)).xyz;
+  vec2 motionPx = mvVelocity.xy * uScale / depth * uMotionBlur;
+  float blurPx = min(length(motionPx), 96.0);
+  float totalPx = sizePx + blurPx;
+  gl_PointSize = totalPx;
   vAge = aAge; vRot = aRot; vAlpha = aAlpha;
-  vAA = 1.5 / px;
+  vMotionDir = blurPx > 0.001 ? motionPx / length(motionPx) : vec2(1.0, 0.0);
+  vMotionAmount = blurPx;
+  vBodyScale = sizePx / totalPx;
+  vAA = 1.5 / sizePx;
 }`;
 
 const FRAG = `
@@ -214,6 +234,9 @@ varying float vAge;
 varying float vRot;
 varying float vAlpha;
 varying float vAA;
+varying vec2 vMotionDir;
+varying float vMotionAmount;
+varying float vBodyScale;
 
 float sdBox(vec2 p, vec2 b) { vec2 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0); }
 float sdTriangle(vec2 p) {
@@ -228,6 +251,19 @@ float sdTriangle(vec2 p) {
 void main() {
   vec2 p = gl_PointCoord - 0.5;
   p.y = -p.y;
+
+  // Stretch the particle into a capsule-like trail. The SDF still evaluates
+  // the selected shape at the body end, so circles keep round caps and custom
+  // shapes remain recognisable instead of turning into a generic line.
+  float trailAlpha = 1.0;
+  if (vMotionAmount > 0.001) {
+    float along = dot(p, vMotionDir);
+    float bodyHalf = 0.5 * vBodyScale;
+    vec2 body = p + vMotionDir * (clamp(along, -bodyHalf, bodyHalf) - along);
+    p = body / max(vBodyScale, 0.0001);
+    trailAlpha = 1.0 - smoothstep(bodyHalf, 0.5, abs(along));
+  }
+
   float c = cos(vRot), s = sin(vRot);
   p = mat2(c, -s, s, c) * p;
 
@@ -240,7 +276,7 @@ void main() {
   else if (uShape == 6) d = sdBox(p, vec2(0.5, 0.09));
   else                  d = length(p) - 0.5;
 
-  float a = (1.0 - smoothstep(-vAA, vAA, d)) * vAlpha * uOpacity;
+  float a = (1.0 - smoothstep(-vAA, vAA, d)) * vAlpha * trailAlpha * uOpacity;
   if (a < 0.004) discard;
   gl_FragColor = vec4(mix(uColorA, uColorB, clamp(vAge, 0.0, 1.0)), a);
 }`;
@@ -278,6 +314,7 @@ export class ParticleField {
     this.geometry.setAttribute('aAge', new THREE.BufferAttribute(this.aAge, 1));
     this.geometry.setAttribute('aRot', new THREE.BufferAttribute(this.aRot, 1));
     this.geometry.setAttribute('aAlpha', new THREE.BufferAttribute(this.aAlpha, 1));
+    this.geometry.setAttribute('aVelocity', new THREE.BufferAttribute(this.vel, 3));
     this.geometry.setDrawRange(0, 0);
 
     this.material = new THREE.ShaderMaterial({
@@ -286,7 +323,8 @@ export class ParticleField {
         uColorB: { value: new THREE.Color('#f472b6') },
         uOpacity: { value: 0.85 },
         uShape: { value: 0 },
-        uScale: { value: 1000 }
+        uScale: { value: 1000 },
+        uMotionBlur: { value: 0 }
       },
       vertexShader: VERT, fragmentShader: FRAG,
       transparent: true, depthWrite: false, depthTest: true,
@@ -379,6 +417,7 @@ export class ParticleField {
     u.uColorB.value.set(s.colorB);
     u.uOpacity.value = s.opacity;
     u.uShape.value = SHAPE_INDEX[s.shape] ?? 0;
+    u.uMotionBlur.value = s.motionBlur;
     const blending = s.additive ? THREE.AdditiveBlending : THREE.NormalBlending;
     if (this.material.blending !== blending) {
       this.material.blending = blending;
@@ -607,7 +646,7 @@ export class ParticleField {
 
   _upload() {
     this.geometry.setDrawRange(0, this.count);
-    for (const name of ['position', 'aSize', 'aAge', 'aRot', 'aAlpha']) {
+    for (const name of ['position', 'aSize', 'aAge', 'aRot', 'aAlpha', 'aVelocity']) {
       this.geometry.getAttribute(name).needsUpdate = true;
     }
   }
