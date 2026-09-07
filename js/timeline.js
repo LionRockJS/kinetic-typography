@@ -128,11 +128,14 @@ const cameraAxisAt = py => Object.keys(CAMERA_ROWS).find(axis => {
 }) ?? 'z';
 
 export class Timeline {
-  constructor(canvas, tipEl) {
+  constructor(canvas, tipEl, headerCanvas = null) {
     this.canvas = canvas;
     this.tip = tipEl;
+    this.headerCanvas = headerCanvas;
     this.ctx = canvas.getContext('2d');
+    this.headerCtx = headerCanvas?.getContext('2d') ?? null;
     this.w = 0; this.h = 0;
+    this.headerH = 30;
     this.hover = null;
     this.drag = null;
     this.collapsedGroups = new Set();
@@ -300,6 +303,13 @@ export class Timeline {
     this.canvas.width = this.w * dpr;
     this.canvas.height = this.h * dpr;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (this.headerCanvas && this.headerCtx) {
+      const headerRect = this.headerCanvas.getBoundingClientRect();
+      this.headerH = Math.max(1, Math.round(headerRect.height || LANE.beats[1] || 30));
+      this.headerCanvas.width = this.w * dpr;
+      this.headerCanvas.height = this.headerH * dpr;
+      this.headerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
     this.draw();
   }
 
@@ -520,28 +530,31 @@ export class Timeline {
 
   // ── events ─────────────────────────────────────────────────
   _bind() {
-    const c = this.canvas;
-    c.addEventListener('pointerdown', e => this.onDown(e));
-    c.addEventListener('pointermove', e => this.onMove(e));
+    const bindSurface = surface => {
+      surface.addEventListener('pointerdown', e => this.onDown(e, surface));
+      surface.addEventListener('pointermove', e => this.onMove(e, surface));
+      surface.addEventListener('pointerleave', () => { this.hover = null; this._tip(null); this.draw(); });
+      surface.addEventListener('wheel', e => this.onWheel(e, surface), { passive: false });
+      surface.addEventListener('click', e => this.onClick(e, surface));
+      surface.addEventListener('dblclick', e => this.onDblClick(e, surface));
+    };
+    bindSurface(this.canvas);
+    if (this.headerCanvas) bindSurface(this.headerCanvas);
     window.addEventListener('pointerup', () => this.onUp());
-    c.addEventListener('pointerleave', () => { this.hover = null; this._tip(null); this.draw(); });
-    c.addEventListener('wheel', e => this.onWheel(e), { passive: false });
-    c.addEventListener('click', e => this.onClick(e));
-    c.addEventListener('dblclick', e => this.onDblClick(e));
     window.addEventListener('resize', () => this.resize());
   }
 
-  _pos(e) {
-    const r = this.canvas.getBoundingClientRect();
+  _pos(e, surface = this.canvas) {
+    const r = surface.getBoundingClientRect();
     return { px: e.clientX - r.left, py: e.clientY - r.top };
   }
 
-  onDown(e) {
-    const { px, py } = this._pos(e);
+  onDown(e, surface = this.canvas) {
+    const { px, py } = this._pos(e, surface);
     const hit = this.hitTest(px, py);
     // Any timeline interaction pauses playback before it starts editing or scrubbing.
     emit('pause');
-    this.canvas.setPointerCapture(e.pointerId);
+    surface.setPointerCapture(e.pointerId);
 
     if (hit.type === 'trackGroup') {
       // Group headers are handled by the click event below. Keeping pointerdown
@@ -719,20 +732,20 @@ export class Timeline {
     this.draw();
   }
 
-  onClick(e) {
-    const { px, py } = this._pos(e);
+  onClick(e, surface = this.canvas) {
+    const { px, py } = this._pos(e, surface);
     const hit = this.hitTest(px, py);
     if (hit.type === 'trackGroup' && e.detail === 1) this.toggleGroup(hit.group);
   }
 
-  onMove(e) {
-    const { px, py } = this._pos(e);
+  onMove(e, surface = this.canvas) {
+    const { px, py } = this._pos(e, surface);
     const d = this.drag;
 
     if (!d) {
       const hit = this.hitTest(px, py);
       this.hover = hit;
-      this.canvas.style.cursor =
+      surface.style.cursor =
         hit.type === 'trackGroup' ? 'pointer'
         : hit.type === 'guide' || hit.type === 'end' || hit.type === 'levelEdge' ? 'ew-resize'
         : hit.type === 'clipColorKey' ? 'ew-resize'
@@ -1047,8 +1060,8 @@ export class Timeline {
     this.draw();
   }
 
-  onWheel(e) {
-    const { px } = this._pos(e);
+  onWheel(e, surface = this.canvas) {
+    const { px } = this._pos(e, surface);
     const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX) && !e.shiftKey;
     const viewport = this.canvas.parentElement;
     const canScrollVertically = viewport && viewport.scrollHeight > viewport.clientHeight;
@@ -1070,8 +1083,8 @@ export class Timeline {
     }
   }
 
-  onDblClick(e) {
-    const { px, py } = this._pos(e);
+  onDblClick(e, surface = this.canvas) {
+    const { px, py } = this._pos(e, surface);
     const hit = this.hitTest(px, py);
     if (hit.type === 'trackGroup') return;
     if (hit.type === 'cameraLane') {
@@ -1160,6 +1173,21 @@ export class Timeline {
     this._drawRow(g, 'animation');
     this._drawGroupHeaders(g);
     this._drawPlayhead(g);
+    this._drawPinnedHeader();
+  }
+
+  /** Redraw the ruler over the scrollable canvas so it remains pinned. */
+  _drawPinnedHeader() {
+    if (!this.headerCtx || !this.headerCanvas) return;
+    const g = this.headerCtx;
+    g.clearRect(0, 0, this.w, this.headerH);
+    g.fillStyle = '#0d0f14';
+    g.fillRect(0, 0, this.w, this.headerH);
+    this._drawRuler(g);
+    this._drawBeats(g);
+    this._drawPlayhead(g, this.headerH);
+    g.fillStyle = '#242a36';
+    g.fillRect(0, this.headerH - 1, this.w, 1);
   }
 
   _drawGroupHeaders(g) {
@@ -2185,12 +2213,12 @@ export class Timeline {
     g.restore();
   }
 
-  _drawPlayhead(g) {
+  _drawPlayhead(g, height = this.h) {
     const x = Math.round(this.x(state.ui.time)) + 0.5;
     if (x < -2 || x > this.w + 2) return;
     g.strokeStyle = '#ff5f56';
     g.lineWidth = 1;
-    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, this.h); g.stroke();
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, height); g.stroke();
     g.fillStyle = '#ff5f56';
     g.beginPath(); g.moveTo(x - 5, 0); g.lineTo(x + 5, 0); g.lineTo(x, 7); g.closePath(); g.fill();
   }

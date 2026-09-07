@@ -96,6 +96,7 @@ input[type="number"] { -moz-appearance: textfield; }
 .is-recording { animation: recpulse 1s ease-in-out infinite; }
 
 #timelineCanvas { touch-action: none; }
+#timelineHeaderCanvas { display: block; width: 100%; height: 30px; touch-action: none; }
 
 /* Keep the editor body usable when optional media lanes or particle emitters
    make the timeline content taller than the available timeline viewport. */
@@ -107,6 +108,19 @@ input[type="number"] { -moz-appearance: textfield; }
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
+
+/* The ruler and beat strip stay available while the lanes underneath scroll. */
+.timeline-pinned {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  height: 30px;
+  margin-bottom: -30px;
+  background: #0a0c11;
+  box-shadow: 0 6px 10px -10px rgba(0, 0, 0, .95);
+}
+
+#timelineViewport > #tlTip { z-index: 30; }
 
 /* ── viewport mode switch ────────────────────────────────── */
 .view-mode-active {

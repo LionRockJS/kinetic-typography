@@ -458,6 +458,9 @@ tailwind.config = {
       </div>
     </div>
     <div id="timelineViewport" class="timeline-scroll relative scroll-thin" aria-label="Timeline tracks">
+      <div id="timelinePinned" class="timeline-pinned">
+        <canvas id="timelineHeaderCanvas" class="block w-full cursor-default" aria-hidden="true"></canvas>
+      </div>
       <canvas id="timelineCanvas" class="block w-full cursor-default"></canvas>
       <div id="tlTip" class="hidden absolute z-10 px-1.5 py-0.5 rounded bg-black/85 border border-line text-[10px] font-mono text-zinc-200 pointer-events-none whitespace-nowrap"></div>
     </div>
