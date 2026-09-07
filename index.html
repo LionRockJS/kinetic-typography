@@ -159,6 +159,10 @@ tailwind.config = {
       <section class="panel">
         <div class="panel-hd"><span>Backdrop video</span><span id="videoChip" class="chip">none</span></div>
         <div class="panel-bd">
+          <label class="flex items-center gap-1.5 text-[10px] text-zinc-500" title="Use this if the media dialog does not open. Applies to audio and video imports.">
+            <input id="standardMediaPicker" type="checkbox">
+            Use standard media file picker
+          </label>
           <div id="videoChannels" class="space-y-1.5"></div>
           <input id="videoFile" type="file" accept="video/*" multiple class="hidden">
           <p class="text-[10px] leading-relaxed text-zinc-600">

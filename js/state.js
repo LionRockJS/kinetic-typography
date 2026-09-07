@@ -291,7 +291,7 @@ export const state = {
   project: freshProject(),
   ui: {
     time: 0, playing: false, loop: false,
-    sel: null,                    // {type:'clip',id} | {type:'guide',level,id,ids} | {type:'camkey',id} | {type:'camera'} | {type:'backdrop'} | {type:'backdropkey',id} | {type:'particle',id} | {type:'particles'} | {type:'audio',kind,id?} | {type:'audioKey',kind,id,keyId}
+    sel: null,                    // {type:'clip',id} | {type:'textTrack',track} | {type:'guide',level,id,ids} | {type:'guideTrack',level} | {type:'camkey',id} | {type:'camera'} | {type:'backdrop'} | {type:'backdropkey',id} | {type:'videoTrack',kind} | {type:'particle',id} | {type:'particles'} | {type:'audio',kind,id?} | {type:'audioKey',kind,id,keyId}
     snap: true, snapGuides: true, snapPeaks: true, snapWords: true, safeArea: false,
     viewMode: 'output',           // 'output' = final camera, 'space' = 3D scene editor
     particle: null,               // id of the particle emitter being edited
@@ -616,6 +616,14 @@ export function selectAudioVolumeKey(kind, clipId, keyId) {
   return key;
 }
 
+/** Select one of the two reference-line lanes without selecting a point. */
+export function selectGuideTrack(levelKey) {
+  if (!state.project.levels[levelKey]) return;
+  if (state.ui.sel?.type === 'guideTrack' && state.ui.sel.level === levelKey) return;
+  state.ui.sel = { type: 'guideTrack', level: levelKey };
+  emit('selection', state.ui.sel);
+}
+
 export const anyAudio = () => Object.values(state.audio.tracks).some(lane =>
   lane.kind === 'bgm'
     ? lane.ready || !!lane.name || Number(lane.duration) > 0
@@ -854,6 +862,14 @@ export const selectedBackdropKey = () =>
 export function selectBackdropTrack() {
   if (state.ui.sel?.type === 'backdrop') return;
   state.ui.sel = { type: 'backdrop' };
+  emit('selection', state.ui.sel);
+}
+
+/** Select one backdrop-video lane without selecting a clip. */
+export function selectVideoTrack(kind) {
+  if (!VIDEO_CHANNEL_KINDS.some(meta => meta.kind === kind)) return;
+  if (state.ui.sel?.type === 'videoTrack' && state.ui.sel.kind === kind) return;
+  state.ui.sel = { type: 'videoTrack', kind };
   emit('selection', state.ui.sel);
 }
 
@@ -1240,6 +1256,15 @@ export function selectedClipIds() {
 export function selectedClips() {
   const ids = new Set(selectedClipIds());
   return clips().filter(c => ids.has(c.id));
+}
+
+/** Select one text-element lane without selecting a layer. */
+export function selectTextTrack(trackIndex) {
+  const track = Number(trackIndex);
+  if (!Number.isInteger(track) || track < 0 || track >= TRACKS) return;
+  if (state.ui.sel?.type === 'textTrack' && state.ui.sel.track === track) return;
+  state.ui.sel = { type: 'textTrack', track };
+  emit('selection', state.ui.sel);
 }
 
 /** Layers in the order the list and range selection read them. */

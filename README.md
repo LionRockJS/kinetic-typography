@@ -41,9 +41,11 @@ downbeat phase correct to within a frame. On a 120 BPM import the app read
 - Audio and backdrop settings are retained in a saved project, but their source
   files are referenced by name rather than embedded, so sources must be
   re-imported after opening a file.
-- The timeline collapses unused audio and backdrop video lanes, and its content
-  scrolls vertically inside a responsive viewport (220–360 px depending on
-  screen height). Adjust `--timeline-viewport-height` in `css/app.css` if needed.
+- Timeline lanes are grouped by function; click a group header to collapse or
+  expand it. Unused audio and backdrop video lanes stay hidden, and the full
+  timeline scrolls vertically inside a responsive viewport (220–360 px
+  depending on screen height). Adjust `--timeline-viewport-height` in
+  `css/app.css` if needed.
 - BGM is one analysed source; VO and SFX lanes can contain multiple independent clips.
 - VO word timing is model-based and approximate; review the waveform and adjust
   the text clip edges when a word is misrecognised or a pause is ambiguous.

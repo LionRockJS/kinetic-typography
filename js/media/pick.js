@@ -26,8 +26,8 @@ export const canPickWithHandles = () => typeof globalThis.showOpenFilePicker ===
  * array when the user cancels, or null when this browser has no picker — the
  * signal for the caller to fall back to its file input.
  */
-async function pick(types, { multiple = false, id }) {
-  if (!canPickWithHandles()) return null;
+async function pick(types, { multiple = false, id, standard = false }) {
+  if (standard || !canPickWithHandles()) return null;
   try {
     const handles = await globalThis.showOpenFilePicker({ types, multiple, id });
     return await Promise.all(handles.map(async handle => ({ file: await handle.getFile(), handle })));

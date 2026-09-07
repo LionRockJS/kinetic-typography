@@ -578,10 +578,20 @@ function buildInspector() {
         ? 'Camera key selected — edit it in the Camera panel below.'
         : state.ui.sel?.type === 'camera'
           ? 'Camera track selected — select a key below to edit its framing.'
+        : state.ui.sel?.type === 'guideTrack'
+          ? `${LEVELS[state.ui.sel.level]?.label ?? 'Reference'} track selected — select a point below to edit its timing.`
         : state.ui.sel?.type === 'particle'
           ? 'Emitter selected — edit it in the Particles panel below.'
         : state.ui.sel?.type === 'particles'
           ? 'Particle track selected — select an emitter below to edit its settings.'
+        : state.ui.sel?.type === 'audio' && !state.ui.sel.id
+          ? `${TRACK_KINDS.find(meta => meta.kind === state.ui.sel.kind)?.label ?? 'Sound'} track selected — select a clip to edit its timing.`
+        : state.ui.sel?.type === 'textTrack'
+          ? `Text element track ${state.ui.sel.track + 1} selected — select a layer to edit it.`
+        : state.ui.sel?.type === 'videoTrack'
+          ? `${VIDEO_CHANNEL_KINDS.find(meta => meta.kind === state.ui.sel.kind)?.label ?? 'Backdrop video'} track selected.`
+        : state.ui.sel?.type === 'backdrop'
+          ? 'Backdrop colour track selected — select a key to edit its look.'
         : 'Select a layer on the timeline, or a 起承轉合 point to move a reference line.'));
     return;
   }
@@ -1301,10 +1311,12 @@ function field(label, node) {
  * Tie a slider to an editable readout, so a value can be dragged for feel or
  * typed when the step would never land on it.
  *
- * Typed digits take effect as they are entered, but the field is only
- * rewritten once the edit finishes — rewriting it under the cursor would clamp
- * the "1" of a "15" being typed. Enter commits, Esc goes back to the value the
- * field was entered with. The range must already hold the current value.
+ * The slider remains live, while the number readout buffers typed digits until
+ * the edit finishes. Updating the model on every input would make the first
+ * digit of a multi-digit value (the "1" of "15", for example) take effect
+ * immediately and can rebuild the properties panel under the cursor. Enter
+ * commits, Esc goes back to the value the field was entered with. The range
+ * must already hold the current value.
  */
 function linkRange(range, num, onChange) {
   const lo = Number(range.min), hi = Number(range.max);
@@ -1326,11 +1338,15 @@ function linkRange(range, num, onChange) {
   range.addEventListener('input', e => { const v = +e.target.value; num.value = fmt(v); onChange(v); });
   num.addEventListener('focus', e => { entry = +range.value; e.target.select(); });
   num.addEventListener('input', e => {
-    const v = parseFloat(e.target.value);
-    if (Number.isFinite(v) && v >= lo && v <= hi) apply(v, false);
+    // Keep the paired slider visually in sync without touching the model. A
+    // typed value like "15" must survive the first "1" input event intact.
+    const raw = e.target.value.trim();
+    const v = raw === '' ? NaN : Number(raw);
+    if (Number.isFinite(v) && v >= lo && v <= hi) range.value = v;
   });
   num.addEventListener('change', e => {
-    const v = parseFloat(e.target.value);
+    const raw = e.target.value.trim();
+    const v = raw === '' ? NaN : Number(raw);
     if (Number.isFinite(v)) apply(v, true);
     else num.value = fmt(+range.value);
   });
@@ -1525,7 +1541,7 @@ function renderVideoChannels() {
     : 'none';
 
   const pick = async (kind, replaceId = null) => {
-    const picked = await pickVideoFiles({ multiple: !replaceId });
+    const picked = await pickVideoFiles({ multiple: !replaceId, standard: $('#standardMediaPicker')?.checked });
     if (picked === null) {                         // no File System Access API here
       const inp = $('#videoFile');
       inp.dataset.kind = kind;
@@ -1897,7 +1913,7 @@ function renderAudioLanes() {
     const pending = lane.filter(clip => !clip.ready);
     const multiple = () => !isBgm;
     const pick = async (attachId = null) => {
-      const picked = await pickAudioFiles({ multiple: multiple() && !attachId });
+      const picked = await pickAudioFiles({ multiple: multiple() && !attachId, standard: $('#standardMediaPicker')?.checked });
       if (picked === null) {                       // no File System Access API here
         const inp = $('#audioFile');
         inp.dataset.kind = meta.kind;
@@ -1927,7 +1943,7 @@ function renderAudioLanes() {
       isBgm && tr.ready
         ? el('span', { class: 'flex-1 min-w-0 truncate text-[11px] text-zinc-300', title: tr.name }, tr.name)
         : el('button', {
-          class: 'btn flex-1 !py-1 !text-[11px]', onClick: pick,
+          class: 'btn flex-1 !py-1 !text-[11px]', onClick: () => pick(),
           title: isBgm ? `Import ${meta.label.toLowerCase()}` : `Add another ${meta.label.toLowerCase()} clip`
         }, isBgm ? `Import ${meta.label.toLowerCase()}…` : `${loaded.length ? 'Add' : 'Import'} ${meta.label.toLowerCase()}…`),
       isBgm && tr.ready ? el('button', {
@@ -1936,7 +1952,7 @@ function renderAudioLanes() {
         onClick: () => { setTrackLevel(meta.kind, { mute: !tr.mute }); renderAudioLanes(); app.timeline.draw(); }
       }, tr.mute ? '⨯' : '♪') : null,
       isBgm && tr.ready ? el('button', {
-        class: 'btn btn-sq !w-6 !h-6', title: 'Replace', onClick: pick
+        class: 'btn btn-sq !w-6 !h-6', title: 'Replace', onClick: () => pick()
       }, '⤒') : null,
       isBgm && tr.ready ? el('button', {
         class: 'btn btn-sq !w-6 !h-6 hover:!text-red-400', title: 'Remove',

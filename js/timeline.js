@@ -30,10 +30,12 @@
 //   double-click a track      → new clip in that phase
 //   double-click a text block → add a colour key at that time
 //   drag the ruler            → scrub · hold ⇧ while scrubbing → snap · ⇧ edits → no snap
+//   click a group header       → collapse / expand that family of lanes
 
 import { state, level, guides, clips, audioClips, savedAudioClips, audioClip, anyAudio, videoClips, videoClip, anyVideo, camera, cameraKeys,
          cameraMode, cameraChannelKeys, selectCameraKey, select, selectGuide,
          selectCameraTrack,
+         selectGuideTrack, selectTextTrack, selectVideoTrack,
          selectGuidesInRange, selectedGuideIds, selectedGuideIndices, setDuration,
          selectClip, selectedClipIds, selectedClips,
          commitClips, commitGuides, commitCameraKeys, addClip, addCameraKey, addCameraChannelKey,
@@ -80,6 +82,17 @@ const ROW = {
   overall:   { lane: LANE.overall,   r: 10, font: 12, label: '整體 Overall' },
   animation: { lane: LANE.animation, r: 8,  font: 10, label: '動態 Animation' }
 };
+const GROUP_HEADER_H = 20;
+const GROUP_GAP = 5;
+const GROUP_META = [
+  { key: 'sound',      label: 'SOUND',                color: '#5fb3e6' },
+  { key: 'camera',     label: 'CAMERA',               color: '#9b86d8' },
+  { key: 'reference',  label: 'REFERENCE · 起承轉合', color: '#38bdf8' },
+  { key: 'text',       label: 'TEXT ELEMENTS',         color: '#34d399' },
+  { key: 'particles',  label: 'PARTICLES',             color: '#f472b6' },
+  { key: 'backdrop',   label: 'BACKDROP',              color: '#a78bfa' }
+];
+const GROUP_ROW = Object.fromEntries(GROUP_META.map(({ key }) => [key, null]));
 const CAMERA_ROWS = {
   x: [114, 136],
   y: [137, 159],
@@ -122,6 +135,7 @@ export class Timeline {
     this.w = 0; this.h = 0;
     this.hover = null;
     this.drag = null;
+    this.collapsedGroups = new Set();
     this._syncLayout();
     this._bind();
     this.resize();
@@ -137,55 +151,87 @@ export class Timeline {
       lane[0] = y;
       lane[1] = y + height;
       LANE[kind] = lane;
+      if (ROW[kind]) ROW[kind].lane = lane;
       return y + height;
     };
-    const hideLane = kind => { LANE[kind] = null; };
+    const hideLane = kind => {
+      LANE[kind] = null;
+      if (ROW[kind]) ROW[kind].lane = null;
+    };
+    const group = (key, y, visible, layout) => {
+      if (!visible) return y;
+      y += GROUP_GAP;
+      GROUP_ROW[key] = [y, y + GROUP_HEADER_H];
+      y += GROUP_HEADER_H;
+      return this.collapsedGroups.has(key) ? y : layout(y);
+    };
+
+    // Reset optional lanes before laying them out again. A collapsed group
+    // keeps its header, but its child lanes disappear from the canvas.
+    for (const kind of AUDIO_LANES) hideLane(kind);
+    for (const kind of VIDEO_LANES) hideLane(kind);
+    hideLane('camera');
+    hideLane('overall');
+    hideLane('animation');
+    hideLane('particles');
+    hideLane('backdrop');
+    TRACK_TOP = null;
+    for (const key of Object.keys(GROUP_ROW)) GROUP_ROW[key] = null;
 
     let y = setLane('ruler', 0, 18);
     y = setLane('beats', y, 12);
 
-    for (const kind of AUDIO_LANES) hideLane(kind);
-    if (hasAudio) {
+    y = group('sound', y, hasAudio, y => {
       y += 2;
       y = setLane('bgm', y, 32) + 2;
       y = setLane('vo', y, 28) + 2;
       y = setLane('sfx', y, 28);
-    }
+      return y;
+    });
 
-    y += 4;
-    const cameraTop = y;
-    y = setLane('camera', cameraTop, 72);
-    const setCameraRow = (axis, top, height) => {
-      CAMERA_ROWS[axis][0] = cameraTop + top;
-      CAMERA_ROWS[axis][1] = cameraTop + top + height;
-    };
-    setCameraRow('x', 2, 22);
-    setCameraRow('y', 25, 22);
-    setCameraRow('z', 48, 22);
+    y = group('camera', y, true, y => {
+      const cameraTop = y;
+      y = setLane('camera', cameraTop, 72);
+      const setCameraRow = (axis, top, height) => {
+        CAMERA_ROWS[axis][0] = cameraTop + top;
+        CAMERA_ROWS[axis][1] = cameraTop + top + height;
+      };
+      setCameraRow('x', 2, 22);
+      setCameraRow('y', 25, 22);
+      setCameraRow('z', 48, 22);
+      return y;
+    });
 
-    y = setLane('overall', y + 4, 24) + 2;
-    y = setLane('animation', y, 24) + 6;
-    TRACK_TOP = y;
-    y += TRACKS * TRACK_H + Math.max(0, TRACKS - 1) * TRACK_GAP;
+    y = group('reference', y, true, y => {
+      y = setLane('overall', y, 24) + 2;
+      y = setLane('animation', y, 24) + 6;
+      return y;
+    });
 
-    // Keep the particle track visible even before its first emitter is added,
-    // like the camera track. One row per emitter keeps overlapping windows
-    // readable once the track has content.
-    const emitters = particleEmitters().length;
-    y += 8;
-    y = setLane('particles', y, Math.max(PARTICLE_H, emitters * PARTICLE_H + Math.max(0, emitters - 1) * PARTICLE_GAP));
+    y = group('text', y, true, y => {
+      TRACK_TOP = y;
+      return y + TRACKS * TRACK_H + Math.max(0, TRACKS - 1) * TRACK_GAP;
+    });
 
-    for (const kind of VIDEO_LANES) hideLane(kind);
-    if (hasVideo) {
-      y += 10;
-      y = setLane('v1', y, 26) + 2;
-      y = setLane('v2', y, 26) + 2;
-      y = setLane('v3', y, 26);
-    }
+    y = group('particles', y, true, y => {
+      // Keep the particle track visible even before its first emitter is added,
+      // like the camera track. One row per emitter keeps overlapping windows
+      // readable once the track has content.
+      const emitters = particleEmitters().length;
+      y += 2;
+      return setLane('particles', y, Math.max(PARTICLE_H, emitters * PARTICLE_H + Math.max(0, emitters - 1) * PARTICLE_GAP));
+    });
 
-    // Keep the colour track at the very bottom, after optional audio/video
-    // lanes, so the backdrop controls read as the composition's final layer.
-    y = setLane('backdrop', y + 10, 32);
+    y = group('backdrop', y, true, y => {
+      if (hasVideo) {
+        y += 5;
+        y = setLane('v1', y, 26) + 2;
+        y = setLane('v2', y, 26) + 2;
+        y = setLane('v3', y, 26);
+      }
+      // Keep the colour track at the very bottom, after optional video lanes.
+      return setLane('backdrop', y + 5, 32);
+    });
 
     const nextHeight = y + 6;
     const changed = nextHeight !== TIMELINE_HEIGHT;
@@ -208,9 +254,32 @@ export class Timeline {
     return i >= 0 && i < particleEmitters().length ? i : -1;
   }
   trackAt(y) {
+    if (TRACK_TOP === null) return -1;
     const i = Math.floor((y - TRACK_TOP) / (TRACK_H + TRACK_GAP));
     return i >= 0 && i < TRACKS ? i : -1;
   }
+
+  toggleGroup(key) {
+    if (!GROUP_ROW[key]) return;
+    if (this.collapsedGroups.has(key)) this.collapsedGroups.delete(key);
+    else this.collapsedGroups.add(key);
+    this.hover = null;
+    this._tip(null);
+    this.draw();
+  }
+
+  groupIsActive(key) {
+    const sel = state.ui.sel;
+    if (!sel) return false;
+    if (key === 'sound') return sel.type === 'audio' || sel.type === 'audioKey';
+    if (key === 'camera') return sel.type === 'camera' || sel.type === 'camkey';
+    if (key === 'reference') return sel.type === 'guide' || sel.type === 'guideTrack';
+    if (key === 'text') return sel.type === 'clip' || sel.type === 'textTrack';
+    if (key === 'particles') return sel.type === 'particle' || sel.type === 'particles';
+    if (key === 'backdrop') return sel.type === 'backdrop' || sel.type === 'backdropkey' || sel.type === 'videoTrack';
+    return false;
+  }
+
   audioVolumeY(volume, y0, y1) {
     const pad = Math.min(4, Math.max(1, (y1 - y0) / 4));
     const span = Math.max(1, y1 - y0 - pad * 2);
@@ -317,8 +386,14 @@ export class Timeline {
 
   hitTest(px, py) {
     if (this._syncLayout() && this.h > 0) this.resize();
+    for (const { key } of GROUP_META) {
+      const lane = GROUP_ROW[key];
+      if (lane && py >= lane[0] && py <= lane[1]) return { type: 'trackGroup', group: key };
+    }
     for (const key of LEVEL_KEYS) {
-      const [y0, y1] = ROW[key].lane;
+      const lane = ROW[key].lane;
+      if (!lane) continue;
+      const [y0, y1] = lane;
       if (py < y0 - 4 || py > y1 + 4) continue;
       const lv = level(key);
       if (!lv) continue;
@@ -363,7 +438,7 @@ export class Timeline {
       return { type: 'track', track: trackIndex, t };
     }
     if (py <= LANE.beats[1]) return { type: 'ruler' };
-    {
+    if (LANE.camera) {
       const [y0, y1] = LANE.camera;
       if (py >= y0 && py <= y1) {
         const axis = cameraMode() === 'split' ? cameraAxisAt(py) : null;
@@ -428,7 +503,7 @@ export class Timeline {
       }
       return { type: 'audioLane', kind };
     }
-    {
+    if (LANE.backdrop) {
       const [y0, y1] = LANE.backdrop;
       if (py >= y0 && py <= y1) {
         const keys = backdropKeys();
@@ -451,6 +526,7 @@ export class Timeline {
     window.addEventListener('pointerup', () => this.onUp());
     c.addEventListener('pointerleave', () => { this.hover = null; this._tip(null); this.draw(); });
     c.addEventListener('wheel', e => this.onWheel(e), { passive: false });
+    c.addEventListener('click', e => this.onClick(e));
     c.addEventListener('dblclick', e => this.onDblClick(e));
     window.addEventListener('resize', () => this.resize());
   }
@@ -466,6 +542,12 @@ export class Timeline {
     // Any timeline interaction pauses playback before it starts editing or scrubbing.
     emit('pause');
     this.canvas.setPointerCapture(e.pointerId);
+
+    if (hit.type === 'trackGroup') {
+      // Group headers are handled by the click event below. Keeping pointerdown
+      // inert lets a double-click toggle once instead of twice.
+      return;
+    }
 
     if (hit.type === 'guide') {
       const gs = guides(hit.key);
@@ -498,6 +580,7 @@ export class Timeline {
                       head, keep: e.altKey, snapshot: head ? gs.map(x => x.t) : null };
       }
     } else if (hit.type === 'guideLane') {
+      selectGuideTrack(hit.key);
       this.drag = { type: 'marquee', key: hit.key, x0: px, x1: px };
     } else if (hit.type === 'levelEdge') {
       const lv = level(hit.key);
@@ -541,7 +624,13 @@ export class Timeline {
     } else if (hit.type === 'video') {
       const clip = videoClip(hit.kind, hit.id);
       if (!clip) return;
+      selectVideoTrack(hit.kind);
       this.drag = { type: 'video', kind: hit.kind, id: hit.id, grab: this.t(px) - clip.start };
+    } else if (hit.type === 'videoLane') {
+      selectVideoTrack(hit.kind);
+      this.drag = { type: 'scrub' };
+      const raw = this.t(px);
+      emit('seek', e.shiftKey ? this.snap(raw).t : raw);
     } else if (hit.type === 'audioVolumeKey') {
       const clip = audioClip(hit.kind, hit.id);
       const key = audioVolumeKey(hit.kind, hit.id, hit.keyId);
@@ -622,12 +711,18 @@ export class Timeline {
                       group: group.map(x => ({ id: x.id, start: x.start, end: x.end, track: x.track })) };
       }
     } else {
-      if (hit.type === 'track') select(null, null);
+      if (hit.type === 'track') selectTextTrack(hit.track);
       this.drag = { type: 'scrub' };
       const raw = this.t(px);
       emit('seek', e.shiftKey ? this.snap(raw).t : raw);
     }
     this.draw();
+  }
+
+  onClick(e) {
+    const { px, py } = this._pos(e);
+    const hit = this.hitTest(px, py);
+    if (hit.type === 'trackGroup' && e.detail === 1) this.toggleGroup(hit.group);
   }
 
   onMove(e) {
@@ -638,7 +733,8 @@ export class Timeline {
       const hit = this.hitTest(px, py);
       this.hover = hit;
       this.canvas.style.cursor =
-        hit.type === 'guide' || hit.type === 'end' || hit.type === 'levelEdge' ? 'ew-resize'
+        hit.type === 'trackGroup' ? 'pointer'
+        : hit.type === 'guide' || hit.type === 'end' || hit.type === 'levelEdge' ? 'ew-resize'
         : hit.type === 'clipColorKey' ? 'ew-resize'
         : hit.type === 'clip' ? (hit.locked ? 'not-allowed' : hit.stage ? 'col-resize' : hit.edge ? 'ew-resize' : 'grab')
         : hit.type === 'camkey' ? 'ew-resize'
@@ -650,8 +746,9 @@ export class Timeline {
         : hit.type === 'video' ? (this.drag ? 'grabbing' : 'grab')
         : hit.type === 'audioVolumeKey' ? 'move'
         : hit.type === 'audio' ? (this.drag ? 'grabbing' : 'grab')
-        : hit.type === 'audioLane' ? 'default'
-        : hit.type === 'videoLane' ? 'default'
+        : hit.type === 'audioLane' ? 'copy'
+        : hit.type === 'videoLane' ? 'copy'
+        : hit.type === 'track' ? 'copy'
         : hit.type === 'guideLane' ? 'crosshair'
         : hit.type === 'ruler' ? 'text' : 'default';
       this.draw();
@@ -944,7 +1041,7 @@ export class Timeline {
     else if (d.type === 'particle') commitEmitters();
     else if (d.type === 'camkey') commitCameraKeys();
     else if (d.type === 'marquee' && Math.abs(d.x1 - d.x0) < 4) {
-      select(null, null);                     // a plain click in the lane clears and scrubs
+      selectGuideTrack(d.key);                // a plain click selects the reference lane
       emit('seek', this.t(d.x0));
     }
     this.draw();
@@ -976,6 +1073,7 @@ export class Timeline {
   onDblClick(e) {
     const { px, py } = this._pos(e);
     const hit = this.hitTest(px, py);
+    if (hit.type === 'trackGroup') return;
     if (hit.type === 'cameraLane') {
       const t = this.snap(hit.t).t;
       if (hit.axis) addCameraChannelKey(hit.axis, t);
@@ -1060,7 +1158,35 @@ export class Timeline {
     this._drawClips(g);
     this._drawRow(g, 'overall');
     this._drawRow(g, 'animation');
+    this._drawGroupHeaders(g);
     this._drawPlayhead(g);
+  }
+
+  _drawGroupHeaders(g) {
+    for (const meta of GROUP_META) {
+      const lane = GROUP_ROW[meta.key];
+      if (!lane) continue;
+      const [y0, y1] = lane;
+      const active = this.groupIsActive(meta.key);
+      const hovered = this.hover?.type === 'trackGroup' && this.hover.group === meta.key;
+      const collapsed = this.collapsedGroups.has(meta.key);
+      const cy = (y0 + y1) / 2;
+
+      g.fillStyle = active ? '#151b26' : '#0b0e13';
+      g.fillRect(0, y0, this.w, y1 - y0);
+      g.strokeStyle = hovered ? meta.color : active ? meta.color + '88' : '#242a36';
+      g.lineWidth = hovered ? 1.5 : 1;
+      g.beginPath(); g.moveTo(0, y1 - 0.5); g.lineTo(this.w, y1 - 0.5); g.stroke();
+
+      g.fillStyle = hovered || active ? '#e4e8ef' : '#768194';
+      g.font = '600 9px ui-monospace, monospace';
+      g.textAlign = 'left'; g.textBaseline = 'middle';
+      g.fillText(`${collapsed ? '▸' : '▾'}  ${meta.label}`, 7, cy);
+      g.fillStyle = '#3f4858';
+      g.font = '9px ui-monospace, monospace';
+      g.textAlign = 'right';
+      g.fillText(collapsed ? 'collapsed' : 'click to collapse', this.w - 8, cy);
+    }
   }
 
   _drawRuler(g) {
@@ -1121,6 +1247,7 @@ export class Timeline {
 
   /** The backdrop colour track: a colour preview rail with draggable keys. */
   _drawBackdropLane(g) {
+    if (!LANE.backdrop) return;
     const [y0, y1] = LANE.backdrop;
     const h = y1 - y0;
     const mid = (y0 + y1) / 2;
@@ -1263,12 +1390,20 @@ export class Timeline {
     const [y0, y1] = LANE[kind];
     const h = y1 - y0;
     const mid = (y0 + y1) / 2;
+    const selected = state.ui.sel?.type === 'videoTrack' && state.ui.sel.kind === kind;
 
-    g.fillStyle = '#0a0c11';
+    g.fillStyle = selected ? '#11151f' : '#0a0c11';
     g.fillRect(0, y0, this.w, h);
+    if (selected) {
+      g.fillStyle = '#a78bfa44';
+      g.fillRect(0, y0, 3, h);
+      g.strokeStyle = '#a78bfa55';
+      g.lineWidth = 1;
+      g.strokeRect(0.5, y0 + 0.5, this.w - 1, h - 1);
+    }
     const lane = videoClips(kind);
     const loaded = lane.filter(clip => clip.ready && clip.duration > 0);
-    g.fillStyle = loaded.length ? meta.color : '#242b37';
+    g.fillStyle = selected ? '#e4e8ef' : loaded.length ? meta.color : '#242b37';
     g.font = '9px ui-monospace, monospace';
     g.textAlign = 'left'; g.textBaseline = 'middle';
     g.fillText(meta.short, 4, mid);
@@ -1343,10 +1478,19 @@ export class Timeline {
     const [y0, y1] = LANE[kind];
     const h = y1 - y0;
     const mid = (y0 + y1) / 2;
+    const selected = (state.ui.sel?.type === 'audio' || state.ui.sel?.type === 'audioKey') &&
+      state.ui.sel.kind === kind;
 
-    g.fillStyle = '#0a0c11';
+    g.fillStyle = selected ? '#111a22' : '#0a0c11';
     g.fillRect(0, y0, this.w, h);
-    g.fillStyle = '#242b37';
+    if (selected) {
+      g.fillStyle = '#5fb3e644';
+      g.fillRect(0, y0, 3, h);
+      g.strokeStyle = '#5fb3e655';
+      g.lineWidth = 1;
+      g.strokeRect(0.5, y0 + 0.5, this.w - 1, h - 1);
+    }
+    g.fillStyle = selected ? '#e4e8ef' : '#242b37';
     g.font = '9px ui-monospace, monospace';
     g.textAlign = 'left'; g.textBaseline = 'middle';
     g.fillText(meta.short, 4, mid);
@@ -1520,6 +1664,7 @@ export class Timeline {
 
   /** The camera track: keys as diamonds, with the framing curve between them. */
   _drawCameraLane(g) {
+    if (!LANE.camera) return;
     const cam = camera();
     const [y0, y1] = LANE.camera;
     const h = y1 - y0;
@@ -1670,11 +1815,22 @@ export class Timeline {
   }
 
   _drawTracks(g) {
+    if (TRACK_TOP === null) return;
+    const selectedTrack = state.ui.sel?.type === 'textTrack'
+      ? state.ui.sel.track : -1;
     for (let i = 0; i < TRACKS; i++) {
       const y = this.trackTop(i);
-      g.fillStyle = i % 2 ? '#0a0c11' : '#0b0e13';
+      const selected = selectedTrack === i;
+      g.fillStyle = selected ? '#111b1a' : i % 2 ? '#0a0c11' : '#0b0e13';
       g.fillRect(0, y, this.w, TRACK_H);
-      g.fillStyle = '#242b37';
+      if (selected) {
+        g.fillStyle = '#34d39955';
+        g.fillRect(0, y, 3, TRACK_H);
+        g.strokeStyle = '#34d39955';
+        g.lineWidth = 1;
+        g.strokeRect(0.5, y + 0.5, this.w - 1, TRACK_H - 1);
+      }
+      g.fillStyle = selected ? '#d7f5e8' : '#242b37';
       g.font = '9px ui-monospace, monospace';
       g.textAlign = 'left'; g.textBaseline = 'middle';
       g.fillText(`T${i + 1}`, 4, y + TRACK_H / 2);
@@ -1686,7 +1842,7 @@ export class Timeline {
     const lv = level(key);
     if (!lv) return;
     const overall = key === 'overall';
-    const top = overall ? LANE.beats[0] : ROW.animation.lane[0];
+    const top = LANE.beats[0];
     const sel = state.ui.sel;
 
     g.save();
@@ -1712,6 +1868,7 @@ export class Timeline {
     const lv = level(key);
     if (!lv) return;
     const row = ROW[key];
+    if (!row.lane) return;
     const [y0, y1] = row.lane;
     const cy = rowCenter(key);
     const gs = lv.guides;
@@ -1719,10 +1876,19 @@ export class Timeline {
     const selIds = new Set(selectedGuideIds(key));
     const pivot = runPivotIndex(key);
     const overall = key === 'overall';
+    const trackSelected = (sel?.type === 'guideTrack' && sel.level === key) ||
+      (sel?.type === 'guide' && sel.level === key);
 
     // lane ground + phase wash
-    g.fillStyle = '#0a0c11';
+    g.fillStyle = trackSelected ? '#11171f' : '#0a0c11';
     g.fillRect(0, y0, this.w, y1 - y0);
+    if (trackSelected) {
+      g.fillStyle = '#38bdf844';
+      g.fillRect(0, y0, 3, y1 - y0);
+      g.strokeStyle = '#38bdf855';
+      g.lineWidth = 1;
+      g.strokeRect(0.5, y0 + 0.5, this.w - 1, y1 - y0 - 1);
+    }
     for (let i = 0; i < gs.length; i++) {
       const x0 = this.x(gs[i].t), x1 = this.x(gs[i + 1]?.t ?? lv.end);
       if (x1 < 0 || x0 > this.w) continue;
@@ -1897,6 +2063,7 @@ export class Timeline {
   }
 
   _drawClips(g) {
+    if (TRACK_TOP === null) return;
     const sel = state.ui.sel;
     const picked = new Set(selectedClipIds());
     for (const c of clips()) {
