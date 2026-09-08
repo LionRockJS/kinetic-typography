@@ -10,7 +10,8 @@
 //            runtime object URLs never leak into project JSON
 
 import { makeLevel, rebuildGuides, normalizeGuides, reframeLevel, drivingRegion, guideHandles,
-         addPair, removePair, LEVEL_KEYS, LEVELS, MAX_REPEATS, defaultEffect } from './structure.js';
+         addPair, addPairAt, removePair, removePairForGuide, removePairForGuides,
+         LEVEL_KEYS, LEVELS, MAX_REPEATS, defaultEffect } from './structure.js';
 import { grid as metroGrid } from './audio/metronome.js';
 import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
 import { makeParticles, makeEmitter, MAX_EMITTERS } from './particles.js';
@@ -2038,6 +2039,67 @@ export function setRepeats(levelKey, n) {
   emit('guides', lv);
   emit('render');
   return ok;
+}
+
+/** Add a new 承轉 pair at the requested timeline time. */
+export function addGuideNode(levelKey, time) {
+  const lv = level(levelKey);
+  if (!lv) return null;
+  const result = addPairAt(lv, time);
+  if (!result) return null;
+  normalizeGuides(lv);
+
+  const primary = result.inserted[0];
+  state.ui.sel = { type: 'guide', level: levelKey, id: primary.id, ids: [primary.id], pivot: null };
+  emit('selection', state.ui.sel);
+  emit('guides', state.project.levels);
+  emit('render');
+  return result;
+}
+
+function announceGuideRemoval(levelKey, lv, result) {
+  const sel = state.ui.sel;
+  if (sel?.type === 'guide' && sel.level === levelKey) {
+    const ids = (sel.ids ?? [sel.id]).filter(selectedId =>
+      lv.guides.some(g => g.id === selectedId));
+    if (result.removed.some(g => g.id === sel.id)) {
+      const nextIndex = Math.min(result.index, lv.guides.length - 1);
+      const next = lv.guides[nextIndex] ?? lv.guides.at(-1);
+      state.ui.sel = next
+        ? { type: 'guide', level: levelKey, id: next.id, ids: [next.id], pivot: null }
+        : { type: 'guideTrack', level: levelKey };
+    } else if (ids.length) {
+      state.ui.sel = { ...sel, ids, pivot: ids.includes(sel.pivot) ? sel.pivot : null };
+    } else {
+      state.ui.sel = { type: 'guideTrack', level: levelKey };
+    }
+    emit('selection', state.ui.sel);
+  }
+
+  emit('guides', state.project.levels);
+  emit('render');
+  return result;
+}
+
+/** Delete exactly one selected adjacent 承轉 or 轉承 pair; surviving node times are untouched. */
+export function removeGuidePair(levelKey, ids) {
+  const lv = level(levelKey);
+  if (!lv) return null;
+  const result = removePairForGuides(lv, ids);
+  return result ? announceGuideRemoval(levelKey, lv, result) : null;
+}
+
+/**
+ * Delete the reference node the user picked. A node belongs to a 承轉 pair;
+ * removing that pair keeps the guide sequence valid and never moves the
+ * points that survive it.
+ */
+export function removeGuideNode(levelKey, id) {
+  const lv = level(levelKey);
+  if (!lv) return null;
+  const result = removePairForGuide(lv, id);
+  if (!result) return null;
+  return announceGuideRemoval(levelKey, lv, result);
 }
 
 /** Reset a level to the default weighting — the one place points do move. */

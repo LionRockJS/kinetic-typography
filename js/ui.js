@@ -3,7 +3,7 @@
 import { state, level, guides, clips, selectedClip, selectedClips, selectedClipIds,
          selectClip, clipsInOrder, selectedGuide, selectedGuideIds,
          selectedGuideIndices, select, selectGuide, on, emit, patch,
-         setRepeats, setDuration, updateClip, setTextStyle, resetClipStyle,
+         setRepeats, removeGuideNode, removeGuidePair, setDuration, updateClip, setTextStyle, resetClipStyle,
          commitGuides, addClip, reframe,
          duplicateClip, removeClip, serialize, deserialize, track, audioClips, savedAudioClips, anyAudio,
          setTrackStart, setTrackLevel, setAudioClipStart, setAudioClipLevel,
@@ -335,6 +335,28 @@ function pickGuide(e, key, id) {
   selectGuide(key, id, (e.metaKey || e.ctrlKey) ? 'toggle' : e.shiftKey ? 'range' : 'set');
 }
 
+function deleteGuideNode(key, id) {
+  const removed = removeGuideNode(key, id);
+  if (!removed) {
+    toast('Keep at least one 承轉 pair; 起 and 合 are fixed anchors');
+    return;
+  }
+  app.timeline.draw();
+  toast('Reference node deleted');
+}
+
+function deleteGuidePair(key, ids) {
+  const removed = removeGuidePair(key, ids);
+  if (!removed) {
+    toast('Select one adjacent 承轉 or 轉承 pair to delete');
+    return;
+  }
+  app.timeline.draw();
+  toast('Reference pair deleted');
+}
+
+const canDeleteGuideNode = (lv, guide) => lv.repeats > 1 && guide.role !== 'he';
+
 function numInput(value, min, max, onChange) {
   return el('input', {
     type: 'number', step: '0.05', min, max, value: round(value, 2),
@@ -354,6 +376,8 @@ function guideRows(key) {
   const wrap = el('div', { class: 'space-y-1' });
   guideHandles(lv.guides).forEach(i => {
     const disp = guideDisplay(lv.guides, i);
+    const guide = lv.guides[i];
+    const canDelete = canDeleteGuideNode(lv, guide);
     const on = selectedGuideIds(key).includes(lv.guides[i].id);
     const end = lv.guides[i + 1]?.t ?? lv.end;
     wrap.append(el('div', {
@@ -369,7 +393,16 @@ function guideRows(key) {
       }, disp.label),
       el('span', { class: 'flex-1 min-w-0 truncate text-[10px] text-zinc-400 font-mono' },
         `${lv.guides[i].t.toFixed(2)}s`),
-      el('span', { class: 'text-[9px] font-mono text-zinc-600 shrink-0' }, `${(end - lv.guides[i].t).toFixed(1)}s`)
+      el('span', { class: 'text-[9px] font-mono text-zinc-600 shrink-0' }, `${(end - lv.guides[i].t).toFixed(1)}s`),
+      el('button', {
+        class: 'btn btn-ghost !px-1 !py-0.5 shrink-0 ' +
+               (canDelete ? 'text-zinc-600 hover:!text-red-400' : 'text-zinc-800'),
+        disabled: !canDelete,
+        title: canDelete
+          ? 'Delete this reference node and its 承轉 pair'
+          : '起 and 合 are fixed, and a level needs at least one 承轉 pair',
+        onClick: e => { e.stopPropagation(); deleteGuideNode(key, guide.id); }
+      }, '✕')
     ));
   });
   return wrap;
@@ -767,7 +800,15 @@ function buildGuideInspector(host, sel) {
         addClip(guide.t, Math.min(end, guide.t + 4), 0);
         app.timeline.draw();
         toast(`Layer added at ${disp.label}`);
-      } }, 'Add layer here'))
+      } }, 'Add layer here')),
+    el('button', {
+      class: 'btn w-full hover:!text-red-400',
+      disabled: !canDeleteGuideNode(lv, guide),
+      title: canDeleteGuideNode(lv, guide)
+        ? 'Delete this reference node and its 承轉 pair. 起 and 合 are fixed anchors.'
+        : '起 and 合 are fixed anchors, and a level needs at least one 承轉 pair',
+      onClick: () => deleteGuideNode(lv.key, guide.id)
+    }, 'Delete node')
   );
   syncInspector();
 }
@@ -783,6 +824,11 @@ function buildRunInspector(host, lv, picked) {
 
   const labels = picked.map(i => guideDisplay(lv.guides, i));
   const pivotIdx = runPivotIndex(lv.key);
+  const roles = picked.map(i => lv.guides[i]?.role);
+  const canDeletePair = picked.length === 2 &&
+    ((roles[0] === 'cheng' && roles[1] === 'zhuan') ||
+      (roles[0] === 'zhuan' && roles[1] === 'cheng')) &&
+    lv.repeats > 1;
 
   const parts = [
     el('div', { class: 'rounded-md border border-line bg-base-900 p-2 space-y-1.5' },
@@ -856,6 +902,17 @@ function buildRunInspector(host, lv, picked) {
 
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
       el('button', { class: 'btn', onClick: () => select(null, null) }, 'Clear selection')),
+
+    picked.length === 2
+      ? el('button', {
+          class: 'btn w-full hover:!text-red-400',
+          disabled: !canDeletePair,
+          title: canDeletePair
+            ? 'Delete exactly this adjacent pair; other reference nodes keep their times.'
+            : 'Select an adjacent 承轉 or 轉承 pair; 起 and 合 are fixed anchors.',
+          onClick: () => deleteGuidePair(lv.key, picked.map(i => lv.guides[i].id))
+        }, 'Delete selected pair')
+      : null,
 
     el('div', { class: 'grid grid-cols-2 gap-1.5' },
       el('button', { class: 'btn', onClick: () => app.seek(from) }, 'Go to start'),
@@ -1913,6 +1970,17 @@ function renderAudioLanes() {
     const pending = lane.filter(clip => !clip.ready);
     const multiple = () => !isBgm;
     const pick = async (attachId = null) => {
+      // Keep the standard input click in the originating user gesture. Awaiting
+      // even an immediately resolved picker promise can consume activation in
+      // embedded Chromium views, leaving the fallback dialog unable to open.
+      if ($('#standardMediaPicker')?.checked) {
+        const inp = $('#audioFile');
+        inp.dataset.kind = meta.kind;
+        inp.dataset.attachId = attachId ?? '';
+        inp.multiple = multiple() && !attachId;
+        inp.click();
+        return;
+      }
       const picked = await pickAudioFiles({ multiple: multiple() && !attachId, standard: $('#standardMediaPicker')?.checked });
       if (picked === null) {                       // no File System Access API here
         const inp = $('#audioFile');
@@ -3137,6 +3205,7 @@ function buildShortcuts() {
     const frame = 1 / state.project.fps;
     const clip = selectedClip();
     const emitter = state.ui.sel?.type === 'particle' ? selectedEmitter() : null;
+    const guide = selectedGuide();
 
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'd') {
       e.preventDefault();
@@ -3192,6 +3261,12 @@ function buildShortcuts() {
           e.preventDefault();
           removeBackdropKey(selectedBackdropKey().id);
           app.timeline.draw();
+        } else if (guide) {
+          e.preventDefault();
+          const ids = selectedGuideIds(guide.level.key);
+          if (ids.length === 2) deleteGuidePair(guide.level.key, ids);
+          else if (ids.length === 1) deleteGuideNode(guide.level.key, guide.guide.id);
+          else toast('Select one adjacent 承轉 or 轉承 pair to delete');
         } else if (clip) {
           e.preventDefault();
           for (const c of selectedClips()) removeClip(c.id);

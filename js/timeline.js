@@ -14,6 +14,7 @@
 // snaps to them.
 //
 //   drag a 起承轉合 point      → move that reference line
+//   double-click a reference lane → add a 承轉 pair at that time
 //   drag the animation ends   → move / stretch the animation arc
 //   drag the end cap          → stretch the whole composition (⌥ keeps positions)
 //   drag a clip               → move it (up/down changes track)
@@ -44,6 +45,7 @@ import { state, level, guides, clips, audioClips, savedAudioClips, audioClip, an
          voiceWordTimes,
          audioVolumeKeys, audioVolumeKey, audioVolumeAt, selectAudioTrack, selectAudioClip,
          selectAudioVolumeKey, addAudioVolumeKey, updateAudioVolumeKey, commitAudioVolumeKeys,
+         addGuideNode,
          particleEmitters, particleEmitter, selectEmitter, activeEmitterId, addParticleEmitter,
          selectParticleTrack, setEmitterWindow, commitEmitters, setStageDuration,
          clipColorKey, selectClipColorKey, addClipColorKey, updateClipColorKey,
@@ -56,7 +58,7 @@ import { VIDEO_CHANNEL_KINDS, VIDEO_EFFECTS } from './video/engine.js';
 import { ROLES, LEVELS, LEVEL_KEYS, guideDisplay, guideHandles, drivingRegion, headIsCombined,
          scaleFromHead, headRange, scaleRange, scaleAboutPivot, translateRange,
          normalizeGuides, reframeLevel, MIN_REGION } from './structure.js';
-import { clamp, fmtTime, nearest } from './util.js';
+import { clamp, fmtTime, nearest, toast } from './util.js';
 import { cameraAt, cameraPosition, cameraChannelAt, defaultCameraPosition } from './camera.js';
 
 const LANE = {
@@ -421,7 +423,7 @@ export class Timeline {
         if (i === 0) continue;                        // folded into the 起承 handle
         if (Math.abs(px - this.x(gs[i].t)) <= HIT) return { type: 'guide', key, index: i };
       }
-      return { type: 'guideLane', key };
+      return { type: 'guideLane', key, t: this.t(px) };
     }
 
     const trackIndex = this.trackAt(py);
@@ -1087,6 +1089,23 @@ export class Timeline {
     const { px, py } = this._pos(e, surface);
     const hit = this.hitTest(px, py);
     if (hit.type === 'trackGroup') return;
+    if (hit.type === 'guide') {
+      const g = guides(hit.key)[hit.index];
+      if (g) selectGuide(hit.key, g.id, 'set');
+      this.draw();
+      return;
+    }
+    if (hit.type === 'guideLane') {
+      const requested = this.snap(hit.t, { ignore: e.shiftKey }).t;
+      const added = addGuideNode(hit.key, requested);
+      if (added) {
+        toast(`Added 承轉 near ${fmtTime(added.inserted[0].t)}`);
+      } else {
+        toast('No room for another 承轉 pair here');
+      }
+      this.draw();
+      return;
+    }
     if (hit.type === 'cameraLane') {
       const t = this.snap(hit.t).t;
       if (hit.axis) addCameraChannelKey(hit.axis, t);

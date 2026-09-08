@@ -146,6 +146,43 @@ export function addPair(level, min = MIN_REGION) {
 }
 
 /**
+ * Add one 承轉 pair at a requested time, leaving every existing point where it
+ * is. The request is placed inside the nearest valid 承 region, so a double
+ * click near a region edge still produces a legal, minimum-sized pair.
+ *
+ * @returns {{index:number, inserted:Array}|null}
+ */
+export function addPairAt(level, time, min = MIN_REGION) {
+  const gs = level.guides;
+  const wanted = Number(time);
+  if (!Number.isFinite(wanted)) return null;
+
+  let best = null;
+  for (let i = 0; i < gs.length; i++) {
+    if (gs[i].role !== 'cheng') continue;
+    const start = gs[i].t;
+    const end = gs[i + 1]?.t ?? level.end;
+    const span = end - start;
+    const turn = clamp(span * 0.15, min, ROLES.zhuan.cap);
+    const lo = start + min;
+    const hi = end - min - turn;
+    if (hi < lo) continue;
+    const at = clamp(wanted, lo, hi);
+    const distance = Math.abs(wanted - at);
+    if (!best || distance < best.distance) best = { i, at, turn, distance };
+  }
+  if (!best) return null;
+
+  const inserted = [
+    { id: uid('g'), role: 'zhuan', t: best.at },
+    { id: uid('g'), role: 'cheng', t: best.at + best.turn }
+  ];
+  gs.splice(best.i + 1, 0, ...inserted);
+  level.repeats++;
+  return { index: best.i + 1, inserted };
+}
+
+/**
  * Drop one 承轉 pair, again leaving every surviving point where it is: the
  * shortest 轉ₖ + 承ₖ₊₁ run is removed, which merges two 承 regions into one.
  */
@@ -162,6 +199,58 @@ export function removePair(level) {
   gs.splice(at, 2);
   level.repeats--;
   return true;
+}
+
+/** Remove exactly the selected adjacent 承轉 or 轉承 pair without relaying out its neighbours. */
+export function removePairForGuides(level, ids) {
+  const gs = level.guides;
+  if (level.repeats <= 1 || !Array.isArray(ids) || new Set(ids).size !== 2) return null;
+
+  const indexes = [...new Set(ids)]
+    .map(id => gs.findIndex(g => g.id === id))
+    .sort((a, b) => a - b);
+  if (indexes.some(i => i < 1) || indexes[1] !== indexes[0] + 1) return null;
+  const at = indexes[0];
+  const roles = [gs[at]?.role, gs[at + 1]?.role];
+  const isPair = (roles[0] === 'cheng' && roles[1] === 'zhuan') ||
+    (roles[0] === 'zhuan' && roles[1] === 'cheng');
+  if (!isPair || at + 1 >= gs.length - 1) return null;
+
+  const removed = gs.splice(at, 2);
+  level.repeats--;
+  return { index: at, removed };
+}
+
+/**
+ * Remove the 承轉 pair containing one selected guide node.
+ *
+ * 起 and 合 are anchors, so only the middle pairs are deletable. Selecting
+ * either point in a pair removes that pair and leaves the surviving points at
+ * their authored times. The return value identifies what was removed so the
+ * store can repair the selection without making the structure layer know
+ * about UI state.
+ */
+export function removePairForGuide(level, id) {
+  const gs = level.guides;
+  if (level.repeats <= 1) return null;
+
+  const i = gs.findIndex(g => g.id === id);
+  if (i < 1 || i >= gs.length - 1) return null;
+
+  let at = -1;
+  if (gs[i].role === 'cheng' && gs[i + 1]?.role === 'zhuan') {
+    // The selected 承 is the first point of its pair.
+    at = i;
+  } else if (gs[i].role === 'zhuan' && gs[i + 1]?.role === 'cheng') {
+    // A middle 轉 is the second point of its pair.
+    at = i - 1;
+  } else if (gs[i].role === 'zhuan' && gs[i - 1]?.role === 'cheng') {
+    // The final 轉 sits immediately before 合 and has no following 承.
+    at = i - 1;
+  }
+
+  if (at < 1 || gs[at]?.role !== 'cheng' || gs[at + 1]?.role !== 'zhuan') return null;
+  return removePairForGuides(level, [gs[at].id, gs[at + 1].id]);
 }
 
 export function rebalanceGuides(level) {

@@ -17,7 +17,7 @@ the optional speech runtime/model only when VO analysis is requested.
 
 | Area | State |
 |---|---|
-| 起承轉合 reference lines | two levels (overall + animation), merged 起承 handle, ratio scaling, multi-select runs, non-destructive pair insertion |
+| 起承轉合 reference lines | two levels (overall + animation), merged 起承 handle, ratio scaling, multi-select runs, pair insertion, and deletable reference nodes |
 | Text layers | 3 tracks, unlimited simultaneous clips, 20 effects, per-clip typeface / weight, 3D position, parent/child offsets, beat reaction, and colour keyframes |
 | Camera | keyframed 3D position / roll with easing, on its own track |
 | Backdrop colour | solid, linear / circular / 4-point gradients with colour keyframes |
@@ -127,7 +127,12 @@ keeps its exact time:
 
 Removing a pair merges the shortest 轉+承 run back together, so stepping the
 count up and down returns to precisely where you started. **Rebalance** is the
-one control that does re-lay-out a level, back to the default weighting.
+one control that does re-lay-out a level, back to the default weighting. Select
+any middle reference node and use its **Delete node** button, the row `×`, or
+`Delete`/`Backspace` to remove its containing 承轉 pair; 起 and 合 stay as the
+level's fixed anchors. When exactly an adjacent 承轉 or 轉承 pair is selected,
+deletion removes only that pair; every other reference node keeps its authored
+time.
 
 ### Rescaling a run of points
 
@@ -358,6 +363,7 @@ used for full-size preview and recording.
 | drag a clip | move it; up/down changes track |
 | drag a clip edge | trim |
 | double-click a track | new layer filling that phase |
+| double-click a reference lane | add a 承轉 pair at that time |
 | double-click inside a clip | add a colour key at that time |
 | drag a colour key | retime the colour change inside its clip |
 | double-click an audio waveform | add a volume key at that time |
